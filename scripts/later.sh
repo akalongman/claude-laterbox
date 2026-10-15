@@ -39,6 +39,8 @@ DISPLAY_WIDTH="${LATER_DISPLAY_WIDTH:-100}"   # session-start only
 SCAN_DEPTH=6
 
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/later/v2"
+# with_lock's refusal, on both of its paths.
+LOCKED_MSG='later: the queue is locked by another writer'
 
 # The terminal link step's notices (session-start only).
 NOTICE_ADDED='later: added the terminal command ~/.local/bin/later; set laterbox.terminal to off in /config to remove it.'
@@ -54,6 +56,8 @@ STAMP_LEN=19   # length of " (YYYY-MM-DD HH:MM)"
 
 # LATER_NOW (epoch seconds) replaces the clock, for tests.
 now() { printf '%s' "${LATER_NOW:-$(date +%s)}"; }
+# LATER_NO_FLOCK=1 makes with_lock take its lock folder where flock exists,
+# for tests: the lock of machines without flock (macOS, Git Bash).
 
 # True when <name> is one plain file name: not empty, not . or .., no / or \,
 # no glob character (`all` would read every matching file as a queue), no
@@ -204,18 +208,89 @@ numbered() {
     done
 }
 
-# Run a command holding the queue's lock. Without flock, run it unlocked.
+# Run a command holding the queue's lock, and return its status: by flock
+# where it exists, else by the lock folder of with_lock_dir. Without a state
+# folder there is nowhere to lock, and the command runs unlocked.
 with_lock() {
     local file="$1"; shift
     mkdir -p "$STATE_DIR" 2>/dev/null
-    if command -v flock >/dev/null 2>&1 && [ -d "$STATE_DIR" ]; then
+    [ -d "$STATE_DIR" ] || { "$@"; return; }
+    if [ "${LATER_NO_FLOCK:-}" != 1 ] && command -v flock >/dev/null 2>&1; then
         (
-            flock -w 5 9 || { echo 'later: the queue is locked by another writer' >&2; exit 1; }
+            flock -w 5 9 || { echo "$LOCKED_MSG" >&2; exit 1; }
             "$@"
         ) 9>"$STATE_DIR/$(state_key "$file").lock"
     else
-        "$@"
+        with_lock_dir "$STATE_DIR/$(state_key "$file").lock.d" "$@"
     fi
+}
+
+# The lock where flock is missing: the folder <lock>, which mkdir makes or
+# refuses in one step on every platform. The holder writes its process id
+# into it, runs the command and removes it, whatever the command's status; a
+# killed holder leaves it behind under a dead id. A waiter tries every 0.1
+# seconds for at most 5 seconds, then refuses. It breaks the folder at once
+# when the id names no live process, and when the folder is over 60 seconds
+# old, which no writer holds it for (the id was reused by another process,
+# or never written). A missing or empty id proves nothing: the holder writes
+# it just after its mkdir. The age costs a process, so it is read once per
+# second of the wait.
+#
+# Two waiters can judge the same folder stale. When the first has removed it
+# and a writer has made a new one, the second's rm removes that one. A
+# breaker therefore sleeps before its next mkdir like any waiter, so that a
+# second breaker's rm, one process start behind its look, lands before the
+# breaker's own mkdir. That narrows the window; it does not close it. A
+# writer that is not breaking can make its folder between the two removals
+# and lose it, and so can a breaker whose sleep is shorter than the other's
+# process start.
+with_lock_dir() { # lock command...
+    local lock="$1" start=$SECONDS tries=0 seen='' aged_at='' pid status
+    shift
+    while ! mkdir "$lock" 2>/dev/null; do
+        if [ -d "$lock" ]; then
+            seen=1
+            pid=''
+            { read -r pid < "$lock/pid"; } 2>/dev/null
+            case $pid in
+                ''|0*|*[!0-9]*) ;;   # no usable id: the age decides
+                *) kill -0 "$pid" 2>/dev/null || { rm -rf "$lock"; pid=broken; } ;;
+            esac
+            if [ "$pid" != broken ] && [ "$aged_at" != "$SECONDS" ]; then
+                aged_at=$SECONDS
+                find "$lock" -prune -mmin +1 -exec rm -rf {} \; 2>/dev/null
+            fi
+        elif [ ! -w "${lock%/*}" ]; then
+            # No folder, yet mkdir failed: released just now, or the state
+            # folder cannot take one (no write permission, read-only, gone).
+            # The second is no other writer: unlocked, as without a state
+            # folder.
+            "$@"; return
+        fi
+        # SECONDS ends the wait; the count ends it too if the clock steps back.
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ] || [ $((SECONDS - start)) -ge 5 ]; then
+            # A folder never seen in the whole wait was no other writer, but
+            # a mkdir that failed for another reason (a file in its place, a
+            # full disk): unlocked, rather than blame a writer.
+            [ -n "$seen" ] || { "$@"; return; }
+            echo "$LOCKED_MSG" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+    { printf '%s\n' "$$" > "$lock/pid"; } 2>/dev/null
+    "$@"
+    status=$?
+    # Removed while it holds this writer's id, or none (the write failed, a
+    # full disk). A folder naming another id was broken while the command
+    # ran (held past 60 seconds, a suspended machine) and is another
+    # writer's now; a new holder that has not written its id yet still looks
+    # like none.
+    pid=''
+    { read -r pid < "$lock/pid"; } 2>/dev/null
+    case $pid in ''|"$$") rm -rf "$lock" ;; esac
+    return "$status"
 }
 
 append_note() {
