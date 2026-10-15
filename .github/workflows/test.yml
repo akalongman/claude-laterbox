@@ -1,0 +1,99 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# bash with -eo pipefail in every job; on Windows that is Git Bash.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    # The suite runs in under a minute here; the rest is installs.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.296
+      - name: Install strace
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y strace
+      - name: Validate the plugin
+        run: claude plugin validate . --strict
+      - name: Test the plugin
+        run: claude plugin test .
+      - name: Run the engine tests
+        # Only this runner can run the process budget case, so a skip fails.
+        run: |
+          bash tests/later.test.sh 2>&1 | tee "$RUNNER_TEMP/suite.log"
+          if grep -q '^SKIP: the process budget' "$RUNNER_TEMP/suite.log"; then
+            echo 'The process budget case was skipped; it must run on Linux.' >&2
+            exit 1
+          fi
+      - name: Run shellcheck
+        run: shellcheck scripts/later scripts/later.sh tests/*.sh
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check that the engine's PATH finds bash 3.2
+        run: |
+          PATH=/usr/bin:/bin:/usr/sbin:/sbin bash -c 'echo "$BASH $BASH_VERSION"; case $BASH_VERSION in 3.2.*) ;; *) exit 1 ;; esac'
+      - name: Run the engine tests
+        run: LATER_TEST_ENGINE_PATH=/usr/bin:/bin:/usr/sbin:/sbin bash tests/later.test.sh
+
+  windows:
+    runs-on: windows-latest
+    # Git Bash starts processes many times slower than Linux.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check that git checked the scripts out with LF
+        run: |
+          git ls-files --eol scripts/later scripts/later.sh tests/assert.sh tests/later.test.sh |
+            awk '{ print } $1 == "i/lf" && $2 == "w/lf" { n++ } END { exit !(NR == 4 && n == 4) }'
+      - name: Wrap jq to write LF line ends
+        # A native jq.exe writes CRLF under Git Bash unless given --binary, and
+        # the suite compares jq -r output literally.
+        run: |
+          real="$(type -P jq)"
+          bin="$(cygpath -u "$RUNNER_TEMP")/jq-lf"
+          mkdir -p "$bin"
+          printf '#!/bin/sh\nexec "%s" --binary "$@"\n' "$real" > "$bin/jq"
+          chmod +x "$bin/jq"
+          [ "$(PATH="$bin:$PATH" type -P jq)" = "$bin/jq" ]
+          out="$(printf '{"a":"b"}' | PATH="$bin:$PATH" jq -r .a | od -An -tx1)"
+          echo "jq -r .a wrote:$out"
+          [ "${out//[!0-9a-f]/}" = 620a ]
+      - name: Run the engine tests
+        run: PATH="$(cygpath -u "$RUNNER_TEMP")/jq-lf:$PATH" bash tests/later.test.sh
+      - name: Time rows on a queue of 2000 notes
+        # No time bound: the time is read from this log.
+        run: |
+          engine="$PWD/scripts/later.sh"
+          t="$(cygpath -u "$RUNNER_TEMP")/rows"
+          mkdir -p "$t/repo" "$t/home" "$t/cache" "$t/state"
+          git -C "$t/repo" init -q
+          for ((i = 1; i <= 2000; i++)); do
+            box=x; [ $((i % 10)) -eq 0 ] && box=' '
+            printf -- '- [%s] note %s (2026-10-01 10:00)\n' "$box" "$i"
+          done > "$t/repo/LATER.local.md"
+          cd "$t/repo" || exit 1
+          time HOME="$t/home" XDG_CACHE_HOME="$t/cache" XDG_STATE_HOME="$t/state" bash "$engine" rows > "$t/rows.out"
+          n="$(awk -F'\t' '$1 == "note" { n++ } END { print n + 0 }' "$t/rows.out")"
+          echo "rows printed $n notes"
+          [ "$n" = 200 ]
