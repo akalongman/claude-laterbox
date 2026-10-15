@@ -54,8 +54,12 @@ OPEN_RE='^[[:space:]]*-[[:space:]]+\[[[:space:]]\][[:space:]]*(.*)$'
 STAMP_RE=' \(([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2})\)$'
 STAMP_LEN=19   # length of " (YYYY-MM-DD HH:MM)"
 
-# LATER_NOW (epoch seconds) replaces the clock, for tests.
-now() { printf '%s' "${LATER_NOW:-$(date +%s)}"; }
+# The bytes 0x80 to 0xBF, which only ever continue a UTF-8 character. Listed,
+# like JSON_CTL below, because a range in a bracket follows the locale.
+UTF8_TAIL=$'\200\201\202\203\204\205\206\207\210\211\212\213\214\215\216\217\220\221\222\223\224\225\226\227\230\231\232\233\234\235\236\237\240\241\242\243\244\245\246\247\250\251\252\253\254\255\256\257\260\261\262\263\264\265\266\267\270\271\272\273\274\275\276\277'
+# One character in UTF-8, two bytes: its length is 1 under a UTF-8 locale.
+UTF8_PROBE=$'\303\251'
+
 # LATER_NO_FLOCK=1 makes with_lock take its lock folder on Linux too, for
 # tests: the lock of macOS and Git Bash.
 
@@ -150,22 +154,94 @@ queue_label() { basename "$(dirname "$1")"; }
 
 state_key() { printf '%s' "$1" | sha1sum | cut -d' ' -f1; }
 
-# One row per open note: "<position>\t<file line>\t<stamp epoch>\t<text>".
-# The epoch is 0 for an undated note; the stamp is stripped from the text.
+# --- the clock ---------------------------------------------------------
+# A stamp is the local wall clock, YYYY-MM-DD HH:MM. Ages and the "new" test
+# compare civil minutes (days since 1970-01-01 times 1440, plus the time of
+# day) in shell arithmetic, so a run calls date once, whatever the number of
+# notes (spec R5.6).
+
+# Sets NOW_EPOCH (seconds), NOW_MIN (the civil minutes of the local wall
+# clock) and NOW_STAMP (YYYY-MM-DD HH:MM, local) from one date call.
+# LATER_NOW, epoch seconds, replaces the clock for tests: GNU date reads it
+# with -d, BSD date with -r. A clock that cannot be read leaves 0, 0 and an
+# empty stamp, and fails. Quiet, because it runs before session-start's
+# silent subshell and BSD date rejects -d loudly; and nothing date prints
+# reaches arithmetic before clock_from has checked it, because an arithmetic
+# error here would end the whole run.
+load_clock() {
+    local fmt='+%s %Y %m %d %H %M' out
+    case ${LATER_NOW:-} in
+        ''|*[!0123456789]*)
+            out=$(date "$fmt" 2>/dev/null) ;;
+        *)
+            out=$(date -d "@$LATER_NOW" "$fmt" 2>/dev/null) # gnu-date-probe
+            clock_from "$out" && return 0
+            out=$(date -r "$LATER_NOW" "$fmt" 2>/dev/null) ;;
+    esac
+    clock_from "$out"
+}
+
+# Sets the clock from date's "<epoch> <Y> <m> <d> <H> <M>"; fails on anything
+# else, leaving 0, 0 and an empty stamp.
+clock_from() { # date output
+    local e y mo d h mi extra
+    NOW_EPOCH=0 NOW_MIN=0 NOW_STAMP=''
+    read -r e y mo d h mi extra <<< "$1"
+    case $e in ''|*[!0123456789]*) return 1 ;; esac
+    [ "${#e}" -le 15 ] && [ -z "$extra" ] && stamp_minutes "$y-$mo-$d $h:$mi" || return 1
+    NOW_EPOCH=$((10#$e)) NOW_MIN=$REPLY NOW_STAMP="$y-$mo-$d $h:$mi"
+}
+
+# Sets REPLY to the days from 1970-01-01 to <year>-<month>-<day> of the
+# proleptic Gregorian calendar, by H. Hinnant's days_from_civil. Its years
+# start in March, so January and February count in the year before: -1 for
+# year 0000, which the era step rounds down by hand, because $(( / ))
+# truncates toward zero. Base 10 forced: "08" is eight, not bad octal.
+civil_days() { # year month day
+    local y=$((10#$1)) m=$((10#$2)) d=$((10#$3)) era yoe doy
+    [ "$m" -le 2 ] && y=$((y - 1))
+    era=$(( (y >= 0 ? y : y - 399) / 400 ))
+    yoe=$(( y - era * 400 ))
+    doy=$(( (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1 ))
+    REPLY=$(( era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468 ))
+}
+
+# Sets REPLY to the civil minutes of <stamp>, "YYYY-MM-DD HH:MM", or to 0,
+# failing, when it is not a real date and time: month 1 to 12, a day the
+# month has (February 29 in leap years only), hour 0 to 23, minute 0 to 59.
+# The shape is checked before any field reaches arithmetic.
+stamp_minutes() { # stamp
+    local s=$1 y mo d h mi last
+    REPLY=0
+    [ "${#s}" -eq 16 ] && [ "${s//[0123456789]/}" = '-- :' ] && [ "${s:4:1}${s:7:1}${s:10:1}${s:13:1}" = '-- :' ] || return 1
+    y=$((10#${s:0:4})) mo=$((10#${s:5:2})) d=$((10#${s:8:2})) h=$((10#${s:11:2})) mi=$((10#${s:14:2}))
+    case $mo in
+        1|3|5|7|8|10|12) last=31 ;;
+        4|6|9|11) last=30 ;;
+        2) if (( y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) )); then last=29; else last=28; fi ;;
+        *) return 1 ;;
+    esac
+    [ "$d" -ge 1 ] && [ "$d" -le "$last" ] && [ "$h" -le 23 ] && [ "$mi" -le 59 ] || return 1
+    civil_days "$y" "$mo" "$d"
+    REPLY=$(( REPLY * 1440 + h * 60 + mi ))
+}
+
+# One row per open note: "<position>\t<file line>\t<stamp minutes>\t<text>".
+# The minutes are 0 for an undated note; the stamp is stripped from the text.
 open_notes() {
-    local file="$1" i=0 raw n text epoch
+    local file="$1" i=0 raw n text mins
     [ -f "$file" ] || return 0
     while IFS= read -r raw; do
         n=${raw%%:*}
         [[ ${raw#*:} =~ $OPEN_RE ]] || continue
         text=${BASH_REMATCH[1]}
-        epoch=0
+        mins=0
         if [[ $text =~ $STAMP_RE ]]; then
-            epoch=$(date -d "${BASH_REMATCH[1]}" +%s 2>/dev/null) || epoch=0
-            [ "$epoch" != 0 ] && text=${text:0:${#text}-STAMP_LEN}
+            stamp_minutes "${BASH_REMATCH[1]}"; mins=$REPLY
+            [ "$mins" != 0 ] && text=${text:0:${#text}-STAMP_LEN}
         fi
         i=$((i + 1))
-        printf '%s\t%s\t%s\t%s\n' "$i" "$n" "$epoch" "$text"
+        printf '%s\t%s\t%s\t%s\n' "$i" "$n" "$mins" "$text"
     done < <(grep -nE "$OPEN_RE" "$file")
 }
 
@@ -181,30 +257,50 @@ row_text() {
     return 1
 }
 
-age_label() {
-    local epoch="$1" days
-    [ "$epoch" = 0 ] && { printf 'undated'; return; }
-    days=$(( ($(now) - epoch) / 86400 ))
-    if [ "$days" -le 0 ]; then printf 'today'; else printf '%sd' "$days"; fi
+# Sets REPLY to the age of a note stamped at <minutes>: undated for 0, else
+# the whole days of 24 hours back from the local clock, today for none.
+age_label() { # minutes
+    local days
+    if [ "$1" = 0 ]; then
+        REPLY=undated
+        return 0
+    fi
+    days=$(( (NOW_MIN - $1) / 1440 ))
+    if [ "$days" -le 0 ]; then REPLY=today; else REPLY="${days}d"; fi
 }
 
-# Clip <text> to <width> characters, marking the cut with "...".
-clip() {
-    local text="$1" width="$2"
-    if [ "${#text}" -gt "$width" ]; then
-        printf '%s...' "${text:0:width-3}"
-    else
-        printf '%s' "$text"
+# Sets REPLY to <text> clipped to <width> characters, the cut marked with
+# "...". Under a byte locale (C, POSIX) a character is a byte, and a cut that
+# lands inside a UTF-8 character steps back to its first byte, at most three
+# bytes, so the display never ends in a broken character.
+clip() { # text width
+    local text=$1 width=$2 cut steps=0
+    if [ "${#text}" -le "$width" ]; then
+        REPLY=$text
+        return 0
     fi
+    cut=$((width - 3))
+    if [ "${#UTF8_PROBE}" -ne 1 ]; then
+        while [ "$steps" -lt 3 ] && [ "$cut" -gt 0 ]; do
+            case ${text:cut:1} in
+                ["$UTF8_TAIL"]) cut=$((cut - 1)); steps=$((steps + 1)) ;;
+                *) break ;;
+            esac
+        done
+    fi
+    REPLY="${text:0:cut}..."
 }
 
 # Rows on stdin -> " N. text (age)", N being the note's position in the queue.
 # With a width, each text is clipped to it.
 numbered() {
-    local width="${1:-}" i n epoch text
-    while IFS=$'\t' read -r i n epoch text; do
-        [ -n "$width" ] && text=$(clip "$text" "$width")
-        printf '%2d. %s (%s)\n' "$i" "$text" "$(age_label "$epoch")"
+    local width="${1:-}" i n mins text
+    while IFS=$'\t' read -r i n mins text; do
+        if [ -n "$width" ]; then
+            clip "$text" "$width"; text=$REPLY
+        fi
+        age_label "$mins"
+        printf '%2d. %s (%s)\n' "$i" "$text" "$REPLY"
     done
 }
 
@@ -308,15 +404,15 @@ append_note() {
 }
 
 cmd_add() {
-    local note file stamp
+    local note file
     note=$(printf '%s' "$*" | tr '\n\r\t' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
     if [ -z "$note" ]; then
         echo 'later: nothing to park (empty note)'
         return 0
     fi
     file=$(queue_file "$PWD") || { echo 'later: cannot resolve the queue here' >&2; return 1; }
-    stamp=$(date -d "@$(now)" '+%Y-%m-%d %H:%M')
-    with_lock "$file" append_note "$file" "$note ($stamp)" || return 1
+    # Without a readable clock the note is parked undated rather than lost.
+    with_lock "$file" append_note "$file" "$note${NOW_STAMP:+ ($NOW_STAMP)}" || return 1
     echo "later: parked -> $note"
 }
 
@@ -336,11 +432,12 @@ cmd_list() {
 # "note\t<position>\t<age>\t<text>" per open note. The text runs to the end
 # of the line and may hold tabs. No queue file: the queue line alone.
 cmd_rows() {
-    local file i n epoch text
+    local file i n mins text
     file=$(queue_file "$PWD") || { echo 'later: cannot resolve the queue here' >&2; return 1; }
     printf 'queue\t%s\n' "$(queue_label "$file")"
-    while IFS=$'\t' read -r i n epoch text; do
-        printf 'note\t%s\t%s\t%s\n' "$i" "$(age_label "$epoch")" "$text"
+    while IFS=$'\t' read -r i n mins text; do
+        age_label "$mins"
+        printf 'note\t%s\t%s\t%s\n' "$i" "$REPLY" "$text"
     done < <(open_notes "$file")
 }
 
@@ -421,7 +518,7 @@ cmd_all() {
         [ -n "$rows" ] || continue
         count=$(row_count "$rows")
         oldest=$(printf '%s\n' "$rows" | cut -f3 | sort -n | head -n1)
-        label=$(age_label "$oldest")
+        age_label "$oldest"; label=$REPLY
         path=$(dirname "$file")
         case "$path" in "$HOME"*) path="~${path#"$HOME"}" ;; esac
         out+=$(printf '%s\t%s\t%s' "$count" "$label" "$path")$'\n'
@@ -609,8 +706,9 @@ json_field() { # json key
 # that changes if the message has to go into model context instead.
 emit() { json_string "$1"; printf '{"systemMessage":%s}\n' "$REPLY"; }
 
-# Base 10 forced: a hand-edited "08" is not octal, and "010" is ten.
-num_or_zero() { case "$1" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$((10#$1))" ;; esac; }
+# Sets REPLY to <text> as a number, base 10 forced (a hand-edited "08" is not
+# octal, and "010" is ten), or to 0, failing, when <text> is not all digits.
+num_or_zero() { case "$1" in ''|*[!0-9]*) REPLY=0; return 1 ;; *) REPLY=$((10#$1)) ;; esac; }
 
 # True when <link> is a symbolic link whose text names `later` in the folder
 # <bin>. Folders are compared with -ef, so a text reaching <bin> through
@@ -647,7 +745,7 @@ terminal_link() {
     # half-written, also when two sessions start at once.
     if [ "$(readlink "$data/bin/later")" != "$root/scripts/later" ]; then
         mkdir -p "$data/bin" || return 0
-        tmp="$data/bin/.later.tmp.$$.$(now)"
+        tmp="$data/bin/.later.tmp.$$.$NOW_EPOCH"
         ln -s "$root/scripts/later" "$tmp" || return 0
         mv -fT "$tmp" "$data/bin/later" || { rm -f "$tmp"; return 0; }
     fi
@@ -700,7 +798,7 @@ terminal_link() {
 }
 
 cmd_session_start() {
-    local input='' cwd src agent file rows='' count sf='' shown=0 digest=0 t floor msg='' notices bad
+    local input='' cwd src agent file rows='' count sf='' l1='' l2='' l3='' shown digest floor msg='' notices bad
     # The whole input, by the read builtin: no process. read fails at the end
     # of the input, which is where it stops.
     IFS= read -r -d '' input
@@ -718,16 +816,23 @@ cmd_session_start() {
 
         mkdir -p "$STATE_DIR" 2>/dev/null
         sf="$STATE_DIR/$(state_key "$file")"
-        if [ -r "$sf" ]; then
-            shown=$(num_or_zero "$(sed -n 1p "$sf")")
-            digest=$(num_or_zero "$(sed -n 2p "$sf")")
-        fi
-        t=$(now)
+        # The state: the epoch of the last display, the epoch of the last
+        # list of oldest notes, and the local minute of the last display,
+        # which a 0.1.0 state lacks. Missing or unreadable: never shown.
+        { IFS= read -r l1; IFS= read -r l2; IFS= read -r l3; } 2>/dev/null < "$sf"
+        num_or_zero "$l1"; shown=$REPLY
+        num_or_zero "$l2"; digest=$REPLY
 
         # New = stamped at or after the MINUTE of the last display. Stamps
         # have minute precision, so comparing against the exact second would
-        # skip a note parked later in the same minute as a display.
-        floor=$(( shown - shown % 60 ))
+        # skip a note parked later in the same minute as a display. Without
+        # the third line, that minute is the one the display's epoch fell in,
+        # counted back from the clock in whole minutes.
+        if num_or_zero "$l3"; then
+            floor=$REPLY
+        else
+            floor=$(( NOW_MIN - (NOW_EPOCH / 60 - shown / 60) ))
+        fi
         local new new_count
         new=$(printf '%s\n' "$rows" | awk -F'\t' -v f="$floor" '$3 != 0 && $3 >= f')
         new_count=$(row_count "$new")
@@ -736,16 +841,17 @@ cmd_session_start() {
         if [ "$new_count" -gt 0 ]; then
             local names='' text
             while IFS=$'\t' read -r _ _ _ text; do
-                names+="${names:+; }$(clip "$text" "$DISPLAY_WIDTH")"
+                clip "$text" "$DISPLAY_WIDTH"
+                names+="${names:+; }$REPLY"
             done < <(printf '%s\n' "$new" | head -n3)
             msg+=", $new_count new: $names"
             [ "$new_count" -gt 3 ] && msg+=", +$((new_count - 3)) more"
         fi
 
-        if [ $(( t - digest )) -ge $(( DIGEST_DAYS * 86400 )) ]; then
+        if [ $(( NOW_EPOCH - digest )) -ge $(( DIGEST_DAYS * 86400 )) ]; then
             msg+=$'\n'"Oldest notes:"$'\n'
             msg+=$(printf '%s\n' "$rows" | sort -s -t$'\t' -k3,3n | head -n "$DIGEST_COUNT" | numbered "$DISPLAY_WIDTH")
-            digest=$t
+            digest=$NOW_EPOCH
         fi
     fi
 
@@ -763,8 +869,9 @@ cmd_session_start() {
     [ -n "$msg" ] || return 0
 
     emit "$msg"
-    # The count state, only when a count line was shown.
-    [ -n "$sf" ] && { printf '%s\n%s\n' "$t" "$digest" > "$sf"; } 2>/dev/null
+    # The count state, only when a count line was shown, and only with a
+    # clock: a display recorded at minute 0 would make every note new again.
+    [ -n "$sf" ] && [ -n "$NOW_STAMP" ] && { printf '%s\n%s\n%s\n' "$NOW_EPOCH" "$digest" "$NOW_MIN" > "$sf"; } 2>/dev/null
     return 0
 }
 
@@ -775,6 +882,7 @@ usage() {
 # Before the dispatch, so session-start stores the setting before any of its
 # early exits. Silent: the session-start path writes nothing to stderr.
 resolve_queue_name "${1:-}" 2>/dev/null
+load_clock 2>/dev/null
 
 case "${1:-}" in
     add)           shift; cmd_add "$@" ;;

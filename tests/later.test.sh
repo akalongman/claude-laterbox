@@ -30,20 +30,36 @@ ENGINE_PATH="$JQ_TRAP:$ENGINE_PATH"
 # Why Git Bash skips every case that makes a symbolic link.
 NO_LINKS="Git Bash's ln -s makes a copy, not a symbolic link"
 
-# Every engine call runs with a throwaway HOME, cache and state folder, UTC,
-# and a fixed clock: 2026-10-04 14:05:00 UTC.
+# Every engine call runs with a throwaway HOME, cache and state folder, the
+# zone ZONE (UTC unless a case sets another for its own runs), and a fixed
+# clock, NOW: 2026-10-04 14:05:00 UTC at first, moved forward by later cases.
 T_HOME="$(mktemp -d)";  TMPDIRS+=("$T_HOME")
 T_CACHE="$(mktemp -d)"; TMPDIRS+=("$T_CACHE")
 T_STATE="$(mktemp -d)"; TMPDIRS+=("$T_STATE")
-NOW=1791122700
+NOW0=1791122700
+NOW=$NOW0
 DAY=86400
+ZONE=UTC
 
 # The default queue file name.
 Q=LATER.local.md
 
+# strace, for the process budget case; empty where it is missing.
+STRACE="$(type -P strace)" || STRACE=''
+
+# The engine's bash, for every helper below. With TRACE_LOG set, strace
+# records in that file the processes the engine starts; nothing else is traced.
+run_engine() { # args...
+    if [ -n "${TRACE_LOG:-}" ]; then
+        "$STRACE" -f -e trace=clone,clone3,fork,vfork -o "$TRACE_LOG" bash "$ENGINE" "$@"
+    else
+        bash "$ENGINE" "$@"
+    fi
+}
+
 lt() { # dir args...
     local dir="$1"; shift
-    ( cd "$dir" && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" TZ=UTC LATER_NOW="$NOW" PATH="$ENGINE_PATH" bash "$ENGINE" "$@" )
+    ( cd "$dir" && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" TZ="$ZONE" LATER_NOW="$NOW" PATH="$ENGINE_PATH" run_engine "$@" )
 }
 
 # The engine keys its state and its lock by the queue's physical path, and on
@@ -340,7 +356,7 @@ printf '%s\n' '- [ ] a1 (2026-09-13 14:05)' '- [ ] a2 (2026-10-04 10:00)' > "$ro
 printf '%s\n' '- [ ] b1' '- [ ] b2' '- [ ] b3 (2026-10-01 10:00)' > "$roots/b/$Q"
 printf '%s\n' '- [x] all closed' > "$roots/c/$Q"
 printf '%s\n' '- [ ] hidden' | tee "$roots/a/node_modules/pkg/$Q" "$roots/a/.worktrees/w/$Q" > "$roots/a/vendor/x/$Q"
-all() { ( cd / && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" TZ=UTC LATER_NOW="$NOW" LATER_ROOTS="$1" PATH="$ENGINE_PATH" bash "$ENGINE" all ); }
+all() { ( cd / && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" TZ="$ZONE" LATER_NOW="$NOW" LATER_ROOTS="$1" PATH="$ENGINE_PATH" run_engine all ); }
 out="$(all "$roots")"
 assert_eq "$(printf '%s\n' "$out" | sed -n 1p)" "  3 open, oldest undated   $roots/b" "largest queue first, undated is oldest"
 assert_eq "$(printf '%s\n' "$out" | sed -n 2p)" "  2 open, oldest 21d       $roots/a" "oldest age of a dated queue"
@@ -367,7 +383,7 @@ fi
 
 hook_in() { "$JQ" -n --arg cwd "$1" --arg src "${2:-startup}" '{cwd: $cwd, source: $src, hook_event_name: "SessionStart"}'; }
 ss_json() { # stdin: hook input; prints the hook's output as it wrote it
-    ( cd / && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" CLAUDE_CODE_ENTRYPOINT=cli TZ=UTC LATER_NOW="$NOW" PATH="$ENGINE_PATH" bash "$ENGINE" session-start )
+    ( cd / && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" CLAUDE_CODE_ENTRYPOINT=cli TZ="$ZONE" LATER_NOW="$NOW" PATH="$ENGINE_PATH" run_engine session-start )
 }
 ss() { # stdin: hook input; prints the user-visible message
     ss_json | "$JQ" -r '.systemMessage // empty'
@@ -424,6 +440,20 @@ assert_eq "$(printf '%s\n' "$out" | sed -n 1p | count_bytes)" "$(( $(printf 'lat
 assert_contains "$(printf '%s\n' "$out" | sed -n 1p)" "xxx..." "clip is marked"
 assert_eq "$(printf '%s\n' "$out" | sed -n 3p | count_bytes)" "$(( 4 + 100 + 8 + 1 ))" "list row clipped to 100 characters"
 assert_contains "$(lt "$lg" list)" "$long" "list prints the note in full"
+
+# Under a byte locale (C) a character is a byte, and a cut that lands inside
+# a UTF-8 character steps back to its first byte, so the display ends on a
+# whole character: one byte back for the first note, two for the second and
+# three for the third. Clipped at 97 bytes plus the marker, these keep 32
+# Georgian letters (96 bytes), xx and 31 letters (95), xx and 23 emoji (94).
+geo50="$(printf 'ა%.0s' $(seq 1 50))"
+emoji30="$(printf '🎉%.0s' $(seq 1 30))"
+cb="$(mk_repo)"
+printf -- '- [ ] %s (2026-10-04 14:00)\n' "$geo50" "xx$geo50" "xx$emoji30" > "$cb/$Q"
+out="$(hook_in "$cb" | LC_ALL=C ss)"
+geo32="$(printf 'ა%.0s' $(seq 1 32))"; geo31="$(printf 'ა%.0s' $(seq 1 31))"; emoji23="$(printf '🎉%.0s' $(seq 1 23))"
+assert_eq "$(printf '%s\n' "$out" | sed -n 1p)" "later: 3 parked in $(basename "$cb"), 3 new: $geo32...; xx$geo31...; xx$emoji23..." "under LC_ALL=C the clip ends on a whole UTF-8 character"
+assert_contains "$out" $'\n'" 3. xx$emoji23... (" "under LC_ALL=C the list rows are clipped on a whole character too"
 
 # Spec R5.1: the output is valid JSON whatever the notes hold. The queue is
 # written directly, because add collapses tabs and carriage returns.
@@ -512,6 +542,122 @@ assert_contains "$(hook_in "$s" | ss)" "Oldest notes:" "corrupt state means neve
 printf '08\n0%s\n' "$NOW" > "$T_CACHE/later/v2/$key"
 out="$(hook_in "$s" | ss; echo "exit $?")"
 assert_eq "$(printf '%s\n' "$out" | sed 's/,.*//')" "later: 13 parked in $(basename "$s")"$'\n'"exit 0" "leading-zero state still displays and exits 0"
+
+# A third line, the local minute of the last display, decides what is new
+# over the first, and reads as decimal too. Under UTC that minute is NOW / 60.
+printf '0\n%s\n0%s\n' "$NOW" "$((NOW / 60))" > "$T_CACHE/later/v2/$key"
+assert_eq "$(hook_in "$s" | ss)" "later: 13 parked in $(basename "$s")" "the third state line, with a leading zero, outranks a never-shown first line"
+
+# --- the clock ----------------------------------------------------------
+# Stamps are local wall-clock minutes, compared in shell arithmetic (spec
+# R5.6). '<+04>-4' (the offset of the spec's Asia/Tbilisi) and '<-05>5' are
+# the POSIX spellings of UTC+4 and UTC-5, which need no zone database.
+PLUS4='<+04>-4'
+MINUS5='<-05>5'
+
+# Ages are whole days of 24 hours back from the local clock, which reads
+# 2026-10-04 14:05 in UTC+4 four hours before NOW0.
+ages="$(mk_repo)"
+printf -- '- [ ] %s\n' 'late yesterday (2026-10-03 23:30)' 'a day and an hour ago (2026-10-03 13:00)' 'twelve days ago (2026-09-22 09:00)' > "$ages/$Q"
+out="$(ZONE=$PLUS4 NOW=$((NOW0 - 4 * 3600)) lt "$ages" list)"
+assert_contains "$out" " 1. late yesterday (today)" "ages: 14 hours 35 minutes back reads today"
+assert_contains "$out" " 2. a day and an hour ago (1d)" "ages: 25 hours back reads 1d, counted on the local clock"
+assert_contains "$out" " 3. twelve days ago (12d)" "ages: twelve days and five hours back reads 12d"
+
+# Real dates only: February 29 in leap years (every fourth year, a century
+# only every fourth century), and year 0000, whose January and February count
+# in the year before it for the day count. The rest stay undated, stamp and
+# all.
+dt="$(mk_repo)"
+printf -- '- [ ] %s\n' 'future leap day (2028-02-29 10:00)' 'past leap day (2024-02-29 10:00)' 'leap century (2000-02-29 10:00)' \
+    'year zero (0000-02-29 12:00)' 'not leap (2027-02-29 10:00)' 'not leap century (2100-02-29 10:00)' 'no such date (2026-13-45 99:99)' > "$dt/$Q"
+out="$(NOW=$NOW0 lt "$dt" rows)"
+assert_eq "$(printf '%s\n' "$out" | sed 1d)" "$(printf 'note\t%s\n' "1${T}today${T}future leap day" "2${T}948d${T}past leap day" "3${T}9714d${T}leap century" \
+    "4${T}740199d${T}year zero" "5${T}undated${T}not leap (2027-02-29 10:00)" "6${T}undated${T}not leap century (2100-02-29 10:00)" \
+    "7${T}undated${T}no such date (2026-13-45 99:99)")" "dates: leap years count, impossible dates stay text"
+
+# A 0.1.0 state file holds two epochs and no minutes; its display converts to
+# the local minute it fell in. Here the display was an hour ago, at 17:05 in
+# UTC+4, and the clock reads 18:05.
+o1="$(mk_repo)"
+printf -- '- [ ] %s\n' 'half an hour ago (2026-10-04 17:35)' 'two hours ago (2026-10-04 16:05)' > "$o1/$Q"
+mkdir -p "$T_CACHE/later/v2"
+printf '%s\n%s\n' "$((NOW0 - 3600))" "$NOW0" > "$T_CACHE/later/v2/$(state_key_of "$o1")"
+assert_eq "$(hook_in "$o1" | ZONE=$PLUS4 NOW=$NOW0 ss)" "later: 2 parked in $(basename "$o1"), 1 new: half an hour ago" "0.1.0 state: a note from after the display is new, one from before it is not"
+
+# The 0.1.0 display fell at second 50 of 17:05, and the clock reads second 30
+# of 18:05: a note stamped 17:05 is new, as 0.1.0 counted it, and one stamped
+# 17:04 is not.
+o2="$(mk_repo)"
+printf -- '- [ ] %s\n' 'in the minute of the display (2026-10-04 17:05)' 'the minute before it (2026-10-04 17:04)' > "$o2/$Q"
+o2_state="$T_CACHE/later/v2/$(state_key_of "$o2")"
+printf '%s\n%s\n' "$((NOW0 - 3600 + 50))" "$NOW0" > "$o2_state"
+assert_eq "$(hook_in "$o2" | ZONE=$PLUS4 NOW=$((NOW0 + 30)) ss)" "later: 2 parked in $(basename "$o2"), 1 new: in the minute of the display" "0.1.0 state: the display's minute counts whatever its second"
+# The state keeps its two epochs and gains the local minute of the display.
+assert_eq "$(tr '\n' ' ' < "$o2_state")" "$((NOW0 + 30)) $NOW0 $(( (NOW0 + 30 + 4 * 3600) / 60 )) " "the state holds the display's epoch, the digest's epoch and the display's local minute"
+
+# A note added at the test clock is announced at the next session start and
+# not at the one after, in a zone ahead of UTC and in one behind it (spec
+# R8.2). The display before the add gives the second start a minute to
+# compare with.
+for zs in "$PLUS4 18:05" "$MINUS5 09:05"; do
+    zone=${zs% *}
+    zn="$(mk_repo)"
+    printf -- '- [ ] %s\n' 'parked before' > "$zn/$Q"
+    hook_in "$zn" | ZONE=$zone NOW=$NOW0 ss >/dev/null
+    ZONE=$zone NOW=$NOW0 lt "$zn" add parked at the test clock >/dev/null
+    assert_eq "$(tail -n1 "$zn/$Q")" "- [ ] parked at the test clock (2026-10-04 ${zs#* })" "$zone: add stamps the local time"
+    assert_eq "$(hook_in "$zn" | ZONE=$zone NOW=$((NOW0 + 3600)) ss)" "later: 2 parked in $(basename "$zn"), 1 new: parked at the test clock" "$zone: the note is announced at the next start"
+    assert_eq "$(hook_in "$zn" | ZONE=$zone NOW=$((NOW0 + 7200)) ss)" "later: 2 parked in $(basename "$zn")" "$zone: and not at the one after"
+done
+
+# One date call per run, not one per note (spec R5.6). This folder's date
+# records each call and runs the real one; only this case puts it first on
+# the engine's PATH.
+DATE_TRAP="$(mk_tmpdir)"
+type -P date > "$DATE_TRAP/real"
+printf '%s\n' '#!/bin/sh' 'd=${0%/*}' 'printf "%s\n" "$*" >> "$d/calls"' 'read -r real < "$d/real"' 'exec "$real" "$@"' > "$DATE_TRAP/date"
+chmod +x "$DATE_TRAP/date"
+dq="$(mk_repo)"
+for i in $(seq 1 20); do printf -- '- [ ] dated %s (2026-10-01 10:00)\n' "$i"; done > "$dq/$Q"
+out="$(ENGINE_PATH="$DATE_TRAP:$ENGINE_PATH" lt "$dq" list)"
+assert_contains "$out" "20. dated 20 (" "the date trap: list runs"
+calls=0; [ -f "$DATE_TRAP/calls" ] && calls="$(count_lines < "$DATE_TRAP/calls")"
+assert_ok "the date trap: list on 20 dated notes runs date once or twice (ran it $calls times)" between 1 2 "$calls"
+
+# The process budget (spec R5.6): a command starts as many processes on 100
+# notes as on 5. strace wraps the engine's bash alone and logs every clone,
+# clone3, fork and vfork of the run.
+if [ "$PLATFORM" != linux ]; then
+    skip "the process budget: strace is Linux only"
+elif [ -z "$STRACE" ] || ! "$STRACE" -f -o /dev/null true >/dev/null 2>&1; then
+    skip "the process budget: strace is missing or cannot trace here"
+else
+    pb5="$(mk_repo)"; pb100="$(mk_repo)"
+    for i in $(seq 1 5); do printf -- '- [ ] note %s (2026-10-01 10:00)\n' "$i"; done > "$pb5/$Q"
+    for i in $(seq 1 100); do printf -- '- [ ] note %s (2026-10-01 10:00)\n' "$i"; done > "$pb100/$Q"
+    forks_of() { # dir command...: the processes one engine run starts there
+        local dir="$1" log; shift
+        log="$(mk_tmpdir)/trace"
+        if [ "$1" = session-start ]; then
+            hook_in "$dir" | TRACE_LOG="$log" ss_json >/dev/null
+        else
+            TRACE_LOG="$log" lt "$dir" "$@" >/dev/null 2>&1
+        fi
+        grep -cE '^[0-9]+ +(clone3?|v?fork)\(' "$log"
+    }
+    # A session start stores the queue name's copy when the copy differs, at
+    # three processes: stored here first, so neither traced run pays for it.
+    hook_in "$e" | ss_json >/dev/null
+    # In this order: the first session start of both queues, and add before
+    # done and drop, so the two runs of a pair see the same state.
+    for cmd in rows list session-start 'add one more' 'done 1' 'drop 1'; do
+        read -r -a words <<< "$cmd"
+        few="$(forks_of "$pb5" "${words[@]}")"; many="$(forks_of "$pb100" "${words[@]}")"
+        assert_eq "$many" "$few" "the process budget: $cmd starts as many processes on 100 notes as on 5"
+        assert_ok "the process budget: strace saw $cmd start processes ($few)" test "$few" -gt 0
+    done
+fi
 
 # --- terminal link ----------------------------------------------------
 # Every case has its own HOME, with the data folder inside it.
