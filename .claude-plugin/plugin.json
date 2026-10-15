@@ -1,7 +1,7 @@
 {
   "name": "laterbox",
   "displayName": "Laterbox",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Parking lot for follow-up notes: /later parks a note at once, even mid-turn, after a model has cleaned its text, and alone opens a pane to work through the notes; a terminal command, later, reaches the same queue; a skill lists, closes and drops notes; a session-start line shows the count.",
   "author": { "name": "Avtandil Kikabidze", "url": "https://github.com/akalongman" },
   "repository": "https://github.com/akalongman/claude-laterbox",
