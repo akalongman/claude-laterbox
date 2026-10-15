@@ -11,8 +11,57 @@
 # Reached through ~/.local/bin/later, a link the plugin's session-start hook
 # keeps; the engine is later.sh beside the file this resolves to.
 
-ENGINE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/later.sh"
-if [ ! -x "$ENGINE" ]; then
+# A CDPATH from the environment would send real_path's cd to another folder.
+unset CDPATH
+
+# Sets REPLY to <path> with every symbolic link resolved, by cd -P and plain
+# readlink (readlink -f is missing before macOS 12.3); fails on a cycle. A
+# copy of real_path in later.sh, which this file cannot source before it has
+# found it: keep the two the same, as the suite checks.
+real_path() { # path
+    local p=$1 here=$PWD hops=0 dir name text
+    REPLY=''
+    while :; do
+        case $p in
+            */*) dir=${p%/*}; name=${p##*/}; [ -n "$dir" ] || dir=/ ;;
+            *) dir=.; name=$p ;;
+        esac
+        # A path that ends in a folder: that folder, entered whole.
+        case $name in ''|.|..) dir=$p; name='' ;; esac
+        # An empty path names nothing; cd reads a leading dash as an option,
+        # and - alone as $OLDPWD.
+        case $dir in
+            '') break ;;
+            -*) dir=./$dir ;;
+        esac
+        cd -P "$dir" 2>/dev/null || break
+        if [ -n "$name" ] && [ -L "./$name" ]; then
+            hops=$((hops + 1))
+            [ "$hops" -le 40 ] || break
+            text=$(readlink "./$name") || break
+            case $text in
+                /*) p=$text ;;
+                *) p=${PWD%/}/$text ;;
+            esac
+            continue
+        fi
+        if [ -n "$name" ]; then REPLY=${PWD%/}/$name; else REPLY=$PWD; fi
+        break
+    done
+    # Back to the starting folder; when it was removed, the result stands.
+    cd "$here" 2>/dev/null || :
+    [ -n "$REPLY" ]
+}
+
+# Resolved in a command substitution, so this shell never leaves the
+# caller's folder, from which the engine finds the queue. From a folder that
+# was removed, the engine then refuses to park, where a shell left in the
+# last folder real_path entered would park in that folder's queue.
+ENGINE=$(real_path "${BASH_SOURCE[0]}" && printf '%s' "${REPLY%/*}/later.sh") || {
+    echo "later: engine not found: cannot resolve the links of ${BASH_SOURCE[0]}" >&2
+    exit 1
+}
+if [ ! -f "$ENGINE" ] || [ ! -x "$ENGINE" ]; then
     echo "later: engine not found or not executable at $ENGINE" >&2
     exit 1
 fi
@@ -21,7 +70,7 @@ only_numbers() {
     [ $# -gt 0 ] || return 1
     local a
     for a in "$@"; do
-        case "$a" in ''|*[!0-9]*) return 1 ;; esac
+        case "$a" in ''|*[!0123456789]*) return 1 ;; esac
     done
 }
 

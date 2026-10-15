@@ -57,15 +57,19 @@ run_engine() { # args...
     fi
 }
 
+# With LT_GONE=1 the run starts in <dir> after <dir> is removed, so its
+# working folder no longer exists.
 lt() { # dir args...
     local dir="$1"; shift
-    ( cd "$dir" && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" TZ="$ZONE" LATER_NOW="$NOW" PATH="$ENGINE_PATH" run_engine "$@" )
+    ( cd "$dir" && { [ "${LT_GONE:-}" != 1 ] || rmdir "$dir"; } && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" TZ="$ZONE" LATER_NOW="$NOW" PATH="$ENGINE_PATH" run_engine "$@" )
 }
 
 # The engine keys its state and its lock by the queue's physical path, and on
-# macOS mktemp's folder sits behind a link.
+# macOS mktemp's folder sits behind a link. The engine spells it with cd -P
+# and $PWD, this with pwd -P: bash gives both the same physical spelling.
 state_key_of() { sha1_of "$(cd "$1" && pwd -P)/$Q"; } # dir
-# The folder that locks the queue in <dir> where flock is missing.
+# The folder that locks the queue in <dir> whenever the folder lock is taken:
+# off Linux, on Linux where flock is missing, and under LATER_NO_FLOCK=1.
 lock_of() { printf '%s/later/v2/%s.lock.d\n' "$T_CACHE" "$(state_key_of "$1")"; } # dir
 
 # --- resolution, add, list -------------------------------------------
@@ -99,6 +103,22 @@ assert_file "$T_HOME/Downloads/foo/$Q" "home-as-repo: queue stays in the directo
 assert_nofile "$T_HOME/$Q" "home-as-repo: HOME queue untouched"
 lt "$T_HOME" add in home itself >/dev/null
 assert_file "$T_HOME/$Q" "HOME itself uses the HOME queue"
+
+# The same with HOME set to a symbolic link to that repository (spec R5.4):
+# the shell spells the folder through the link, git by its real path, and
+# the comparison still holds. A guard on Linux and macOS; on Git Bash the
+# case above is the one that tells, because git prints C:/Users/x there and
+# the shell /c/Users/x.
+if [ "$PLATFORM" = gitbash ]; then
+    skip "a linked HOME that is a repository keeps its folders' queues apart: $NO_LINKS"
+else
+    hlink="$(mk_tmpdir)/home"; ln -s "$T_HOME" "$hlink"
+    mkdir -p "$T_HOME/Documents/bar"
+    home_before="$(file_digest "$T_HOME/$Q")"
+    T_HOME="$hlink" lt "$hlink/Documents/bar" add under a linked home >/dev/null
+    assert_file "$T_HOME/Documents/bar/$Q" "linked HOME as repo: a folder under it gets its own queue"
+    assert_eq "$(file_digest "$T_HOME/$Q")" "$home_before" "linked HOME as repo: the HOME queue is untouched"
+fi
 
 q="$(mk_repo)"
 out="$(lt "$q" add "$(printf 'line one\nline   two\t end ')")"
@@ -185,6 +205,21 @@ else
     lt "$lk" done 1 >/dev/null
     assert_ok "symlinked queue stays a symlink" test -L "$lk/$Q"
     assert_eq "$(sed -n 1p "$store/notes.md")" "- [x] linked one" "rewrite lands in the link target"
+    # A chain: an absolute link to a link whose relative text goes up and
+    # through a link to a folder. Every link stays, the file at the end is
+    # rewritten, and its folder keeps no temporary file.
+    ch="$(mk_repo)"; cs="$(mk_tmpdir)"
+    mkdir -p "$cs/real" "$cs/hop"
+    printf '%s\n' '- [ ] chained one' '- [ ] chained two' > "$cs/real/notes.md"
+    ln -s "$cs/real" "$cs/dirlink"
+    ln -s ../dirlink/notes.md "$cs/hop/rel"
+    ln -s "$cs/hop/rel" "$ch/$Q"
+    assert_eq "$(lt "$ch" done 2)" "later: done -> chained two" "a chain of links: done closes the note"
+    assert_eq "$(sed -n 2p "$cs/real/notes.md")" "- [x] chained two" "a chain of links: the file at its end is rewritten"
+    for l in "$ch/$Q" "$cs/hop/rel" "$cs/dirlink"; do
+        assert_ok "a chain of links: ${l##*/} stays a link" test -L "$l"
+    done
+    assert_eq "$(ls -A "$cs/real")" "notes.md" "a chain of links: no temporary file is left beside the file"
 fi
 
 nq="$(mk_repo)"
@@ -381,7 +416,8 @@ assert_eq "$(line_bytes "$rf/$Q" 2)" "$l3" "CRLF: drop leaves the last line byte
 # the last line stays without one, closed or not, and the line before a
 # dropped last line keeps its own line end. Whole files are compared, since
 # sed adds a newline to an unterminated last line on some platforms.
-crlf_file() { printf '%s\r\n' "${@:1:$#-1}"; printf '%s' "${!#}"; } # lines...: CRLF ends, none after the last
+# printf runs its format once on an empty list, so one line alone skips it.
+crlf_file() { [ $# -gt 1 ] && printf '%s\r\n' "${@:1:$#-1}"; printf '%s' "${!#}"; } # lines...: CRLF ends, none after the last
 ne="$(mk_repo)"
 crlf_file '- [ ] one' '- [ ] two' '- [ ] three' > "$ne/$Q"
 lt "$ne" done 1 >/dev/null
@@ -437,6 +473,12 @@ else
     mkdir -p "$lroot/p"; printf '%s\n' '- [ ] via link' > "$ltarget/notes.md"
     ln -s "$ltarget/notes.md" "$lroot/p/$Q"
     assert_eq "$(all "$lroot")" "  1 open, oldest undated   $lroot/p"$'\n'"  1 open in 1 queues" "all counts a symlinked queue"
+    # A dangling link, a link to a folder and a folder, each named like the
+    # queue, are no queue: all skips them and counts the linked one alone.
+    mkdir -p "$lroot/dangling" "$lroot/tofolder" "$lroot/folder/$Q" "$ltarget/$Q"
+    ln -s "$ltarget/gone.md" "$lroot/dangling/$Q"
+    ln -s "$ltarget/$Q" "$lroot/tofolder/$Q"
+    assert_eq "$(all "$lroot")" "  1 open, oldest undated   $lroot/p"$'\n'"  1 open in 1 queues" "all skips a dangling link, a link to a folder and a folder named like the queue"
 fi
 
 # --- session-start ----------------------------------------------------
@@ -608,6 +650,21 @@ assert_eq "$(printf '%s\n' "$out" | sed 's/,.*//')" "later: 13 parked in $(basen
 printf '0\n%s\n0%s\n' "$NOW" "$((NOW / 60))" > "$T_CACHE/later/v2/$key"
 assert_eq "$(hook_in "$s" | ss)" "later: 13 parked in $(basename "$s")" "the third state line, with a leading zero, outranks a never-shown first line"
 
+# --- a project path with a space --------------------------------------
+# Review Focus 2: a repository under a folder named "with space", whose own
+# name holds one too, reached from a subfolder that holds one as well.
+
+wsp="$(mk_tmpdir)/with space"; mkdir -p "$wsp"
+ws="$wsp/the repo"; mv "$(mk_repo)" "$ws"; mkdir -p "$ws/sub dir"
+assert_eq "$(lt "$ws/sub dir" add spaced out 2>&1)" "later: parked -> spaced out" "a path with a space: add"
+assert_file "$ws/$Q" "a path with a space: the queue sits at the repository's root"
+assert_nofile "$ws/sub dir/$Q" "a path with a space: no queue in the subfolder"
+assert_eq "$(lt "$ws/sub dir" list 2>&1)" "the repo: 1 parked"$'\n'" 1. spaced out (today)" "a path with a space: list"
+assert_eq "$(hook_in "$ws/sub dir" | ss | sed -n 1p)" "later: 1 parked in the repo, 1 new: spaced out" "a path with a space: session-start"
+assert_eq "$(all "$wsp")" "  1 open, oldest today     $ws"$'\n'"  1 open in 1 queues" "a path with a space: all"
+assert_eq "$(lt "$ws/sub dir" done 1 2>&1)" "later: done -> spaced out" "a path with a space: done 1"
+assert_eq "$(grep -c '^- \[x\] spaced out' "$ws/$Q")" "1" "a path with a space: done 1 closes the note in the root's queue"
+
 # --- the clock ----------------------------------------------------------
 # Stamps are local wall-clock minutes, compared in shell arithmetic (spec
 # R5.6). '<+04>-4' (the offset of the spec's Asia/Tbilisi) and '<-05>5' are
@@ -719,6 +776,72 @@ else
     done
 fi
 
+# --- portability ------------------------------------------------------
+# Spec R5.5: no GNU-only construct outside a comment. The one date -d left is
+# load_clock's probe, whose line ends in the comment gnu-date-probe.
+
+gnu="$( cd "$HERE/.." && grep -nE 'date -d|chmod --reference|-xtype|mv -fT|readlink -f' scripts/later.sh scripts/later | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' | grep -v 'gnu-date-probe' )"
+assert_eq "$gnu" "" "no GNU-only construct in the engine or the front-end"
+# Spec R5.1: no line names jq, comments aside, so a jq guard cannot return
+# unseen by the trap, which catches only calls.
+jqw="$( cd "$HERE/.." && grep -nwE 'jq' scripts/later.sh scripts/later | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' )"
+assert_eq "$jqw" "" "no line of the engine or the front-end names jq, comments aside"
+sk="$(sed -n '/^state_key() {/,/^}/p' "$ENGINE")"
+assert_contains "$sk" "sha1sum" "state_key hashes with sha1sum"
+assert_contains "$sk" "shasum -a 1" "state_key falls back to shasum -a 1"
+# The front-end cannot source the engine before it has found it, so it
+# carries a copy of real_path, which must stay the engine's.
+RP_FN="$(sed -n '/^real_path() {/,/^}/p' "$ENGINE")"
+assert_ok "the engine defines real_path" test -n "$RP_FN"
+assert_eq "$(sed -n '/^real_path() {/,/^}/p' "$HERE/../scripts/later")" "$RP_FN" "the front-end's real_path is the engine's"
+
+# real_path as the engine defines it, run in a subshell of this suite on the
+# engine's PATH, from <dir>: "<status>|<REPLY>|<working folder after>".
+rp() { # dir path
+    ( cd "$1" && PATH="$ENGINE_PATH" && eval "$RP_FN" && { real_path "$2"; printf '%s|%s|%s\n' "$?" "$REPLY" "$PWD"; } )
+}
+if [ "$PLATFORM" = gitbash ]; then
+    skip "real_path resolves links like readlink -f: $NO_LINKS"
+else
+    rd="$(mk_tmpdir)"; rdp="$(cd "$rd" && pwd -P)"
+    mkdir -p "$rd/real/sub" "$rd/-dash"
+    : > "$rd/real/sub/f"; : > "$rd/-dash/f"
+    ln -s real "$rd/dl"                  # a relative link to a folder
+    ln -s "$rd/dl/sub/f" "$rd/abs"       # an absolute link through it
+    ln -s ../../abs "$rd/real/sub/up"    # a relative link that climbs
+    ln -s .. "$rd/real/sub/parent"       # a link to the folder above
+    ln -s nowhere "$rd/dangling"
+    ln -s c2 "$rd/c1"; ln -s c1 "$rd/c2" # a cycle
+    assert_eq "$(rp "$rd" "$rd/real/sub/f")" "0|$rdp/real/sub/f|$rd" "real_path: a file is its physical path"
+    assert_eq "$(rp "$rd/real/sub" f)" "0|$rdp/real/sub/f|$rd/real/sub" "real_path: a bare name is in the working folder"
+    assert_eq "$(rp "$rd/dl" sub/f)" "0|$rdp/real/sub/f|$rd/dl" "real_path: a relative path from a linked folder, which stays the working folder"
+    assert_eq "$(rp "$rd" "$rd/real/sub/up")" "0|$rdp/real/sub/f|$rd" "real_path: a chain of relative and absolute links, through a linked folder"
+    assert_eq "$(rp "$rd" "$rd/real/sub/parent")" "0|$rdp/real|$rd" "real_path: a link to the folder above"
+    assert_eq "$(rp "$rd" -dash/f)" "0|$rdp/-dash/f|$rd" "real_path: a relative folder that starts with a dash"
+    assert_eq "$(rp "$rd" "$rd/dangling")" "0|$rdp/nowhere|$rd" "real_path: a dangling link resolves to the name it names, as readlink -f does"
+    assert_eq "$(rp "$rd/dl" "$rd/c1")" "1||$rd/dl" "real_path: a cycle fails, and the working folder stays"
+    assert_eq "$(rp "$rd" "$rd/missing/f")" "1||$rd" "real_path: a missing folder fails"
+fi
+
+# Spec R5.5: where sha1sum is missing, shasum -a 1 gives the state key, the
+# same digest, so a queue keeps its state. NOSHA links every program on the
+# engine's PATH but sha1sum; the jq trap stays first.
+if [ "$PLATFORM" = gitbash ]; then
+    skip "the state key without sha1sum: $NO_LINKS"
+elif ! ( PATH="$ENGINE_PATH"; command -v shasum ) >/dev/null 2>&1; then
+    skip "the state key without sha1sum: no shasum on the engine's PATH"
+else
+    NOSHA="$(mk_tmpdir)"
+    IFS=: read -r -a path_dirs <<< "${ENGINE_PATH#"$JQ_TRAP:"}"
+    for pd in "${path_dirs[@]}"; do
+        [ -d "$pd" ] && ln -s "$pd"/* "$NOSHA/" 2>/dev/null
+    done
+    rm -f "$NOSHA/sha1sum"
+    ns="$(mk_repo)"; printf '%s\n' '- [ ] keyed by shasum' > "$ns/$Q"
+    assert_eq "$(hook_in "$ns" | ENGINE_PATH="$JQ_TRAP:$NOSHA" ss | sed -n 1p)" "later: 1 parked in $(basename "$ns")" "without sha1sum: session-start counts the queue"
+    assert_file "$T_CACHE/later/v2/$(state_key_of "$ns")" "without sha1sum: the state sits under the key sha1sum gives"
+fi
+
 # --- terminal link ----------------------------------------------------
 # Every case has its own HOME, with the data folder inside it.
 
@@ -776,6 +899,36 @@ else
     sl "$h" >/dev/null
     assert_eq "$(readlink "$h/data/bin/later")" "$ROOT/scripts/later" "a data link to another root is repointed"
     assert_eq "$(find "$h/data/bin" -name '.later.tmp.*' | count_lines)" "0" "no temporary link is left"
+
+    # The data link is swapped by mv without -T, which moves into a folder,
+    # also one reached through a link. A data link to a folder is replaced
+    # and nothing lands in that folder; a folder in the data link's place is
+    # left alone, with nothing in it, and no link is made.
+    h="$(mk_home)"; mkdir -p "$h/data/bin" "$h/elsewhere"; ln -s "$h/elsewhere" "$h/data/bin/later"
+    assert_eq "$(sl "$h")" "$ADDED" "a data link to a folder: replaced, and the user link added"
+    assert_eq "$(readlink "$h/data/bin/later")" "$ROOT/scripts/later" "a data link to a folder: now names the plugin's front-end"
+    assert_eq "$(ls -A "$h/elsewhere")" "" "a data link to a folder: nothing lands in the folder it named"
+    h="$(mk_home)"; mkdir -p "$h/data/bin/later"
+    assert_eq "$(sl "$h")" "" "a folder in the data link's place: no notice"
+    assert_eq "$(ls -A "$h/data/bin/later")" "" "a folder in the data link's place: nothing lands in it"
+    assert_fail "a folder in the data link's place: no user link" test -L "$h/.local/bin/later"
+
+    # Spec R5.7: a plugin root whose scripts/later is missing or cannot run
+    # gets no link and no notice. The root is a copy, so its front-end can
+    # change; with the front-end intact the copy links its own, as the real
+    # root does.
+    cr="$(mk_tmpdir)"; mkdir -p "$cr/scripts"; cp "$ROOT/scripts/later.sh" "$ROOT/scripts/later" "$cr/scripts/"
+    h="$(mk_home)"
+    assert_eq "$(ENGINE="$cr/scripts/later.sh" sl "$h")" "$ADDED" "a copied plugin root links"
+    assert_eq "$(readlink "$h/data/bin/later")" "$(cd "$cr" && pwd -P)/scripts/later" "a copied plugin root: the data link names the copy's front-end"
+    chmod a-x "$cr/scripts/later"
+    h="$(mk_home)"
+    assert_eq "$(ENGINE="$cr/scripts/later.sh" sl "$h")" "" "a front-end that is not executable: no notice"
+    assert_ok "a front-end that is not executable: no link" untouched "$h"
+    rm "$cr/scripts/later"
+    h="$(mk_home)"
+    assert_eq "$(ENGINE="$cr/scripts/later.sh" sl "$h")" "" "a missing front-end: no notice"
+    assert_ok "a missing front-end: no link" untouched "$h"
 
     h="$(mk_home)"; sl "$h" >/dev/null
     assert_eq "$(sl "$h" CLAUDE_PLUGIN_OPTION_TERMINAL=off)" "$REMOVED" "off removes an own link, announced"
@@ -852,6 +1005,24 @@ else
     cp "$FRONT" "$fe/later"
     assert_fail "a front-end without its engine exits non-zero" env HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" PATH="$ENGINE_PATH" "$fe/later"
     assert_contains "$(HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" PATH="$ENGINE_PATH" "$fe/later" 2>&1)" "later: engine not found or not executable at $(cd "$fe" && pwd -P)/later.sh" "a front-end without its engine names the path it tried"
+
+    # The front-end finds its engine without leaving the caller's folder, and
+    # the engine reads the queue's place from that folder, also when it was
+    # removed: add refuses there, and no queue appears anywhere else. The
+    # plugin copy sits in a repository, where a front-end that had entered
+    # its own folder would park the note, and lt runs it through two links,
+    # as a terminal does. Bare later and all still answer.
+    fr="$(mk_repo)"; fl="$(mk_tmpdir)"; mkdir -p "$fr/scripts"
+    cp "$FRONT" "${FRONT%/*}/later.sh" "$fr/scripts/"
+    ln -s "$fr/scripts/later" "$fl/data-later"; ln -s "$fl/data-later" "$fl/later"
+    out="$(LT_GONE=1 ENGINE="$fl/later" lt "$(mk_tmpdir)" add from a removed folder 2>&1; echo "exit $?")"
+    assert_contains "$out" "later: cannot resolve the queue here" "the front-end from a removed folder: add refuses"
+    assert_contains "$out" "exit 1" "the front-end from a removed folder: add exits 1"
+    for qf in "$fr/$Q" "$fr/scripts/$Q" "$fl/$Q"; do
+        assert_nofile "$qf" "the front-end from a removed folder: no queue made elsewhere"
+    done
+    assert_eq "$(LT_GONE=1 ENGINE="$fl/later" lt "$(mk_tmpdir)" 2>/dev/null)" "later: no parked notes" "the front-end from a removed folder: bare later lists"
+    assert_contains "$(LT_GONE=1 LATER_ROOTS="$w" ENGINE="$fl/later" lt "$(mk_tmpdir)" all 2>/dev/null)" "open in 1 queues" "the front-end from a removed folder: all scans"
 fi
 
 # --- the queue file name ----------------------------------------------

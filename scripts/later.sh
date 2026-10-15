@@ -23,6 +23,10 @@
 # script owns WHAT. No `set -e`: the hook path must exit 0 whatever happens,
 # so a broken reminder can never delay or block a session.
 
+# A CDPATH from the environment would send a cd below to another folder, and
+# make it print that folder.
+unset CDPATH
+
 DEFAULT_QUEUE_NAME='LATER.local.md'
 # The queue file's name for this run, set by resolve_queue_name.
 QUEUE_NAME=$DEFAULT_QUEUE_NAME
@@ -79,7 +83,7 @@ usable_queue_name() {
     # old UTF-8 maximum), so only a name over 42 needs its bytes counted.
     [ "${#name}" -le 42 ] && return 0
     bytes=$(printf '%s' "$name" | wc -c)
-    [ "${bytes//[!0-9]/}" -le 255 ]
+    [ "${bytes//[!0123456789]/}" -le 255 ]
 }
 
 # Sets QUEUE_NAME from the first of these that gives a usable name:
@@ -126,28 +130,86 @@ store_queue_name() {
     fi
 }
 
-# Root of the main checkout containing <dir>, or nothing outside a work tree.
-# A linked worktree resolves to the main checkout through the common git dir.
-project_root() {
-    local dir="$1" top gitdir common
-    top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 0
-    gitdir=$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null) || return 0
-    common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+# Sets REPLY to <path> with every symbolic link resolved, in its folders too,
+# as readlink -f does where it exists (it is missing before macOS 12.3): a
+# missing last part stays as named. Each step enters a folder with cd -P and
+# reads a link with plain readlink. It fails after 40 links, which ends a
+# cycle, and at a folder it cannot enter. It goes back to the working folder
+# it started in when it can; when it cannot, because that folder was
+# removed, the shell stays elsewhere, so a caller that reads a relative path
+# afterwards calls it in a subshell. scripts/later carries a copy, since it
+# cannot source this file before it has found it; the suite checks that the
+# two stay the same.
+real_path() { # path
+    local p=$1 here=$PWD hops=0 dir name text
+    REPLY=''
+    while :; do
+        case $p in
+            */*) dir=${p%/*}; name=${p##*/}; [ -n "$dir" ] || dir=/ ;;
+            *) dir=.; name=$p ;;
+        esac
+        # A path that ends in a folder: that folder, entered whole.
+        case $name in ''|.|..) dir=$p; name='' ;; esac
+        # An empty path names nothing; cd reads a leading dash as an option,
+        # and - alone as $OLDPWD.
+        case $dir in
+            '') break ;;
+            -*) dir=./$dir ;;
+        esac
+        cd -P "$dir" 2>/dev/null || break
+        if [ -n "$name" ] && [ -L "./$name" ]; then
+            hops=$((hops + 1))
+            [ "$hops" -le 40 ] || break
+            text=$(readlink "./$name") || break
+            case $text in
+                /*) p=$text ;;
+                *) p=${PWD%/}/$text ;;
+            esac
+            continue
+        fi
+        if [ -n "$name" ]; then REPLY=${PWD%/}/$name; else REPLY=$PWD; fi
+        break
+    done
+    # Back to the starting folder; when it was removed, the result stands.
+    cd "$here" 2>/dev/null || :
+    [ -n "$REPLY" ]
+}
+
+# Sets REPLY to the root of the main checkout containing <dir>, or to nothing
+# outside a work tree. A linked worktree resolves to the main checkout
+# through the common git dir. One git call prints the top level, the git dir
+# and the common dir, a line each; a path holding a newline reads as no work
+# tree. The root is spelled as cd -P and $PWD spell it, as the shell spells
+# every other folder here, which git does not do everywhere (spec R5.4: git
+# under Git Bash prints C:/Users/x, the shell /c/Users/x); a root that cd
+# cannot enter stays as git printed it. It leaves the shell in the root:
+# queue_file, its one caller, runs in a command substitution.
+project_root() { # dir
+    local out top gitdir common nl=$'\n'
+    REPLY=''
+    out=$(git -C "$1" rev-parse --path-format=absolute --show-toplevel --git-dir --git-common-dir 2>/dev/null) || return 0
+    top=${out%%"$nl"*}; out=${out#*"$nl"}
+    gitdir=${out%%"$nl"*}; common=${out#*"$nl"}
+    case $common in *"$nl"*) return 0 ;; esac
     if [ "$gitdir" != "$common" ]; then
-        dirname "$common"
-    else
-        printf '%s\n' "$top"
+        top=${common%/*}
+        [ -n "$top" ] || top=/
     fi
+    if cd -P "$top" 2>/dev/null; then REPLY=$PWD; else REPLY=$top; fi
 }
 
 # Queue file for <dir>. $HOME is itself a git repository on a dotfiles setup,
 # so a root equal to $HOME is discarded unless <dir> is $HOME; otherwise every
 # directory under it without a repository of its own would share one queue.
+# The three are compared as cd -P spells them (spec R5.4). Every caller runs
+# it in a command substitution, so the folders it and project_root enter
+# never reach the caller's shell.
 queue_file() {
-    local dir home root
-    dir=$(cd "$1" 2>/dev/null && pwd -P) || return 1
-    home=$(cd "$HOME" 2>/dev/null && pwd -P)
-    root=$(project_root "$dir")
+    local dir home='' root
+    cd -P "$1" 2>/dev/null || return 1
+    dir=$PWD
+    cd -P "$HOME" 2>/dev/null && home=$PWD
+    project_root "$dir"; root=$REPLY
     if [ -n "$root" ] && [ "$root" = "$home" ] && [ "$dir" != "$home" ]; then
         root=''
     fi
@@ -156,7 +218,18 @@ queue_file() {
 
 queue_label() { basename "$(dirname "$1")"; }
 
-state_key() { printf '%s' "$1" | sha1sum | cut -d' ' -f1; }
+# Sets REPLY to the lock and state key of a queue path: its SHA-1 in hex. By
+# sha1sum, or by shasum -a 1 where sha1sum is missing (stock macOS), which
+# gives the same digest, so a queue keeps its key across the two.
+state_key() { # path
+    local sum
+    if command -v sha1sum >/dev/null 2>&1; then
+        sum=$(printf '%s' "$1" | sha1sum)
+    else
+        sum=$(printf '%s' "$1" | shasum -a 1)
+    fi
+    REPLY=${sum%% *}
+}
 
 # --- the clock ---------------------------------------------------------
 # A stamp is the local wall clock, YYYY-MM-DD HH:MM. Ages and the "new" test
@@ -326,16 +399,17 @@ numbered() {
 # flock, and those two do not exclude each other. Without a state folder
 # there is nowhere to lock, and the command runs unlocked.
 with_lock() {
-    local file="$1"; shift
+    local file="$1" key; shift
     mkdir -p "$STATE_DIR" 2>/dev/null
     [ -d "$STATE_DIR" ] || { "$@"; return; }
+    state_key "$file"; key=$REPLY
     if [ "${LATER_NO_FLOCK:-}" != 1 ] && [[ ${OSTYPE:-} == linux* ]] && command -v flock >/dev/null 2>&1; then
         (
             flock -w 5 9 || { echo "$LOCKED_MSG" >&2; exit 1; }
             "$@"
-        ) 9>"$STATE_DIR/$(state_key "$file").lock"
+        ) 9>"$STATE_DIR/$key.lock"
     else
-        with_lock_dir "$STATE_DIR/$(state_key "$file").lock.d" "$@"
+        with_lock_dir "$STATE_DIR/$key.lock.d" "$@"
     fi
 }
 
@@ -367,7 +441,7 @@ with_lock_dir() { # lock command...
             pid=''
             { read -r pid < "$lock/pid"; } 2>/dev/null
             case $pid in
-                ''|0*|*[!0-9]*) ;;   # no usable id: the age decides
+                ''|0*|*[!0123456789]*) ;;   # no usable id: the age decides
                 *) kill -0 "$pid" 2>/dev/null || { rm -rf "$lock"; pid=broken; } ;;
             esac
             if [ "$pid" != broken ] && [ "$aged_at" != "$SECONDS" ]; then
@@ -464,6 +538,9 @@ cmd_rows() {
 # writes the file's last line without a newline when the file had none and
 # that line is kept. A line that a dropped last line followed keeps its own
 # line end. The last byte costs one process, whatever the queue's size.
+# cp -p gives the temporary file the queue's mode before the new content
+# goes into it (chmod --reference, which did that after, is GNU only), so a
+# queue its owner cannot write is refused here, as append_note refuses it.
 close_notes() {
     local mode="$1" file="$2"; shift 2
     local guarded='' expect='' rows count n lines tmp verb target dir text ended
@@ -471,7 +548,11 @@ close_notes() {
         guarded=1; expect="${2-}"; shift 2
     fi
     # Rewrite beside the real file, so a symlinked queue stays a symlink.
-    target=$(readlink -f "$file" 2>/dev/null) || target=$file
+    # real_path may run in this shell (the folder lock), and it goes back to
+    # this folder; nothing below or after this function reads a relative
+    # path, since the queue path from queue_file is absolute.
+    target=$file
+    real_path "$file" && target=$REPLY
     # The temporary file takes a short name of its own: the queue's name plus
     # a suffix would pass the 255-byte limit of a name for a queue name of
     # 249 bytes or more, which usable_queue_name accepts. A target without a
@@ -484,7 +565,7 @@ close_notes() {
     count=$(row_count "$rows")
     for n in "$@"; do
         case "$n" in
-            ''|*[!0-9]*|??????????*) echo "later: not a note number: $n" >&2; return 1 ;;
+            ''|*[!0123456789]*|??????????*) echo "later: not a note number: $n" >&2; return 1 ;;
         esac
         if [ -n "$guarded" ] && { ! text=$(row_text "$rows" "$((10#$n))") || [ "$text" != "$expect" ]; }; then
             echo "later: note $n changed since it was listed; nothing changed" >&2
@@ -502,12 +583,12 @@ close_notes() {
     # 1 when the file ends in a newline; the substitution drops that newline.
     ended=1
     [ -n "$(tail -c1 "$target")" ] && ended=0
-    if awk -v lines="$lines" -v mode="$mode" -v ended="$ended" '
+    if cp -p "$target" "$tmp" && awk -v lines="$lines" -v mode="$mode" -v ended="$ended" '
             BEGIN { split(lines, a, " "); for (k in a) pick[a[k]] = 1 }
             (NR in pick) { if (mode == "drop") next; sub(/\[[[:space:]]\]/, "[x]") }
             { if (held) print kept; kept = $0; kept_nr = NR; held = 1 }
             END { if (held) printf "%s%s", kept, ((ended == 1 || kept_nr < NR) ? "\n" : "") }
-        ' "$target" > "$tmp" && chmod --reference="$target" "$tmp" && mv "$tmp" "$target"; then
+        ' "$target" > "$tmp" && mv "$tmp" "$target"; then
         verb='done'; [ "$mode" = drop ] && verb='dropped'
         for n in "$@"; do
             printf 'later: %s -> %s\n' "$verb" "$(row_text "$rows" "$((10#$n))")"
@@ -531,6 +612,10 @@ cmd_close() {
     with_lock "$file" close_notes "$mode" "$file" "$@"
 }
 
+# Every path under the scan roots named like the queue that is a file or a
+# symbolic link. Which links are queues is the reader's test, [ -f ], which
+# follows them: a link to a regular file is one, a dangling link or a link
+# to a folder is none. (find -xtype f made that test, in GNU find only.)
 find_queues() {
     local roots="${LATER_ROOTS:-$HOME}" root
     local IFS=':'
@@ -538,13 +623,14 @@ find_queues() {
         [ -d "$root" ] || continue
         find "$root" -maxdepth "$SCAN_DEPTH" \
             \( -name node_modules -o -name vendor -o -name .git -o -name .worktrees \) -prune \
-            -o -xtype f -name "$QUEUE_NAME" -print 2>/dev/null
+            -o \( -type f -o -type l \) -name "$QUEUE_NAME" -print 2>/dev/null
     done | sort -u
 }
 
 cmd_all() {
     local file rows count oldest label path out='' total=0 queues=0
     while IFS= read -r file; do
+        [ -f "$file" ] || continue
         rows=$(open_notes "$file")
         [ -n "$rows" ] || continue
         count=$(row_count "$rows")
@@ -739,7 +825,7 @@ emit() { json_string "$1"; printf '{"systemMessage":%s}\n' "$REPLY"; }
 
 # Sets REPLY to <text> as a number, base 10 forced (a hand-edited "08" is not
 # octal, and "010" is ten), or to 0, failing, when <text> is not all digits.
-num_or_zero() { case "$1" in ''|*[!0-9]*) REPLY=0; return 1 ;; *) REPLY=$((10#$1)) ;; esac; }
+num_or_zero() { case "$1" in ''|*[!0123456789]*) REPLY=0; return 1 ;; *) REPLY=$((10#$1)) ;; esac; }
 
 # True when <link> is a symbolic link whose text names `later` in the folder
 # <bin>. Folders are compared with -ef, so a text reaching <bin> through
@@ -767,18 +853,36 @@ terminal_link() {
     case "$(uname -s)" in Linux|Darwin) ;; *) return 0 ;; esac
     local root data user tmp link path_state state seen_link='' seen_path=''
     # The script's own resolved location, never CLAUDE_PLUGIN_ROOT, which a
-    # hook of another plugin can inherit.
-    root=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P) || return 0
+    # hook of another plugin can inherit. Its folder is physical, so the
+    # folder above it is the plugin root. This step runs in a command
+    # substitution, so the folders real_path enters are left with it.
+    real_path "${BASH_SOURCE[0]}" || return 0
+    root=${REPLY%/*}; root=${root%/*}
+    # Spec R5.7: no link to a front-end that is missing or cannot run.
+    [ -f "$root/scripts/later" ] && [ -x "$root/scripts/later" ] || return 0
     data=$CLAUDE_PLUGIN_DATA
     user="$HOME/.local/bin/later"
 
     # The data link, replaced by a rename so it is never missing or
-    # half-written, also when two sessions start at once.
+    # half-written, also when two sessions start at once. mv without -T
+    # (GNU only) moves into a folder when the destination is one or links to
+    # one: a link to a folder there is removed first, and a folder ends the
+    # step. A folder that appears between that check and the rename catches
+    # the temporary link, which is then taken out of it. The front-end above
+    # is a file, so the link this makes is never a link to a folder.
     if [ "$(readlink "$data/bin/later")" != "$root/scripts/later" ]; then
         mkdir -p "$data/bin" || return 0
+        if [ -d "$data/bin/later" ]; then
+            [ -L "$data/bin/later" ] || return 0
+            rm -f "$data/bin/later" || return 0
+        fi
         tmp="$data/bin/.later.tmp.$$.$NOW_EPOCH"
         ln -s "$root/scripts/later" "$tmp" || return 0
-        mv -fT "$tmp" "$data/bin/later" || { rm -f "$tmp"; return 0; }
+        mv -f "$tmp" "$data/bin/later" || { rm -f "$tmp"; return 0; }
+        if [ -d "$data/bin/later" ]; then
+            rm -f "$data/bin/later/${tmp##*/}"
+            return 0
+        fi
     fi
 
     if [ "${CLAUDE_PLUGIN_OPTION_TERMINAL:-}" = off ]; then
@@ -846,7 +950,7 @@ cmd_session_start() {
         count=$(row_count "$rows")
 
         mkdir -p "$STATE_DIR" 2>/dev/null
-        sf="$STATE_DIR/$(state_key "$file")"
+        state_key "$file"; sf="$STATE_DIR/$REPLY"
         # The state: the epoch of the last display, the epoch of the last
         # list of oldest notes, and the local minute of the last display,
         # which a 0.1.0 state lacks. Missing or unreadable: never shown.
