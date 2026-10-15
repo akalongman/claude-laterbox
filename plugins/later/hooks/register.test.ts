@@ -65,6 +65,7 @@ const PANE_ID = 'later-notes';
 const CHECK = 'Check the S3 retry path in UploadJob';
 const ASK = 'Ask the payments team about the invoice export';
 const RAISE = 'Raise the queue timeout on staging';
+const RERUN = 'Rerun the flaky test';
 const LISTING = 'app: 2 parked\n 1. Move the upload config to env (3d)\n 2. Recheck the retry path (today)\n';
 const HEADLESS = { ...SESSION, isInteractive: false } as const;
 
@@ -613,8 +614,7 @@ for (const surface of SURFACES) {
             const ui = await openPane($, surface);
             expect(await shows(ui, 'shop: 3 parked')).toBe(true);
             expect((await ui.find({ key: key(CHECK) }))?.text).toStartWith(`> 1. ${CHECK}`);
-            expect((await ui.find({ key: key(ASK) }))?.text).toContain(`2. ${ASK}`);
-            expect((await ui.find({ key: key(ASK) }))?.text).not.toStartWith('> ');
+            expect((await ui.find({ key: key(ASK) }))?.text).toStartWith(`  2. ${ASK}`);
             expect(await shows(ui, '(12d)')).toBe(true);
             expect(await buttonKeys(ui)).toEqual([
                 key(CHECK),
@@ -726,13 +726,58 @@ for (const surface of SURFACES) {
         });
 
         test('duplicate notes get distinct rows, and d acts on the one selected', async ($, on) => {
-            const rerun = 'Rerun the flaky test';
-            const world = stage(on, { rows: () => rowsOf('shop', [['today', rerun], ['today', rerun]]) });
+            const world = stage(on, { rows: () => rowsOf('shop', [['today', RERUN], ['today', RERUN]]) });
             const ui = await openPane($, surface);
-            expect(await buttonKeys(ui)).toEqual(expect.arrayContaining([key(rerun, 1), key(rerun, 2)]));
-            await personFocus($, key(rerun, 2));
+            expect(await buttonKeys(ui)).toEqual(expect.arrayContaining([key(RERUN, 1), key(RERUN, 2)]));
+            await personFocus($, key(RERUN, 2));
             await ui.press({ key: 'done' });
-            expect(engineCalls(world)).toContainEqual(['done', '--if', rerun, '2']);
+            expect(engineCalls(world)).toContainEqual(['done', '--if', RERUN, '2']);
+        });
+
+        test('a second d pressed while the first runs is ignored', async ($, on) => {
+            const world = stage(on, liveQueue([RERUN, RERUN, RAISE]).world);
+            const ui = await openPane($, surface);
+            await Promise.all([ui.press({ key: 'done' }), ui.press({ key: 'done' })]);
+            expect(engineCalls(world).filter(([verb]) => verb === 'done')).toEqual([['done', '--if', RERUN, '1']]);
+            expect(await shows(ui, 'shop: 2 parked')).toBe(true);
+            expect((await ui.find({ key: key(RERUN) }))?.text).toStartWith(`> 1. ${RERUN}`);
+        });
+
+        test('a twin closed elsewhere leaves the marker on the selected text', async ($, on) => {
+            const queue = liveQueue([RERUN, RERUN, RAISE]);
+            const world = stage(on, queue.world);
+            const ui = await openPane($, surface);
+            await personFocus($, key(RERUN, 2));
+            queue.set([RERUN, RAISE]);
+            await world.clock.advance(5_000);
+            expect((await ui.find({ key: key(RERUN) }))?.text).toStartWith(`> 1. ${RERUN}`);
+            expect((await ui.find({ key: key(RAISE) }))?.text).toStartWith('  2. ');
+            await ui.press({ key: 'done' });
+            expect(engineCalls(world)).toContainEqual(['done', '--if', RERUN, '1']);
+        });
+
+        test('d on the first of two twins selects the row now at its place', async ($, on) => {
+            const world = stage(on, liveQueue([RERUN, RAISE, RERUN]).world);
+            const ui = await openPane($, surface);
+            await ui.press({ key: 'done' });
+            expect(engineCalls(world)).toContainEqual(['done', '--if', RERUN, '1']);
+            expect((await ui.find({ key: key(RAISE) }))?.text).toStartWith('> 1. ');
+        });
+
+        test('d on the last of two twins selects the row now at its place', async ($, on) => {
+            const world = stage(on, liveQueue([RERUN, RAISE, RERUN]).world);
+            const ui = await openPane($, surface);
+            await personFocus($, key(RERUN, 2));
+            await ui.press({ key: 'done' });
+            expect(engineCalls(world)).toContainEqual(['done', '--if', RERUN, '3']);
+            expect((await ui.find({ key: key(RAISE) }))?.text).toStartWith('> 2. ');
+        });
+
+        test('a note ending in a space is closed with the space', async ($, on) => {
+            const world = stage(on, { rows: () => rowsOf('shop', [['today', 'text ']]) });
+            const ui = await openPane($, surface);
+            await ui.press({ key: 'done' });
+            expect(engineCalls(world)).toContainEqual(['done', '--if', 'text ', '1']);
         });
 
         test('a note holding a tab is drawn whole and sent whole', async ($, on) => {

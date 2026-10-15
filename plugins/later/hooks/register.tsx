@@ -29,11 +29,12 @@ type Parked =
     | { readonly ok: false; readonly line: string };
 
 // What the module knows of this session, in one object `register` creates: whether the session is interactive (only
-// then does a bare run open the pane), whether the pane is open, how many reads of the queue are in flight and how
-// many have started, and the refresh timer (C1).
+// then does a bare run open the pane), whether the pane is open, whether an action on a note is running, how many
+// reads of the queue are in flight and how many have started, and the refresh timer (C1).
 type PaneSession = {
     isInteractive: boolean;
     isPaneOpen: boolean;
+    isActing: boolean;
     readsInFlight: number;
     readsStarted: number;
     refreshTimer: Timer;
@@ -315,17 +316,25 @@ function firstSelection(queue: Queue): Selection {
     return selectionOf(notesOf(queue)[0]);
 }
 
-// The selection after a re-read. A note still listed stays selected. A note that vanished gives way to the row now
-// at its former index, or to the last row. With no rows there is none, and from none the first row is taken.
-function reselect(before: Queue, after: Queue, selected: Selection): Selection {
+// The selection after a re-read. A note still listed stays selected. Identical notes are told apart only by their
+// order, so when an earlier twin closes, the selected one's key shifts (`note:2:A` becomes `note:1:A`) while the note
+// is still there, and the queue does not say which twin closed: a selected key that vanished while its text is still
+// listed moves to the last note with that text. The note the pane itself closed (`closedKey`), or one whose text is
+// gone, gives way to the row now at its former index, or to the last row. With no rows there is none, and from none
+// the first row is taken.
+function reselect(before: Queue, after: Queue, selected: Selection, closedKey?: string): Selection {
     if (selected.kind === 'none') {
         return firstSelection(after);
     }
     const rows = notesOf(after);
-    if (rows.some((row) => row.key === selected.key)) {
-        return selected;
-    }
     const formerIndex = notesOf(before).findIndex((row) => row.key === selected.key);
+    if (selected.key !== closedKey) {
+        const text = notesOf(before)[formerIndex]?.text;
+        const kept = rows.find((row) => row.key === selected.key) ?? rows.findLast((row) => row.text === text);
+        if (kept !== undefined) {
+            return selectionOf(kept);
+        }
+    }
     return selectionOf(rows[formerIndex] ?? rows.at(-1));
 }
 
@@ -423,8 +432,8 @@ async function ringToRow($: EngineInterface, key: string): Promise<void> {
 // that moved to another note takes the ring with it (C3) unless an input holds it. A read overtaken by one that
 // started after it writes nothing: a tick that read before a `d` would otherwise put the closed note back. The check
 // runs once, before the two writes; a read that started and settled between them would still be written over, which
-// takes an engine run faster than a state write.
-async function refresh($: EngineInterface, session: PaneSession): Promise<void> {
+// takes an engine run faster than a state write. `closedKey` names the note a `d` or `x` of the pane just closed.
+async function refresh($: EngineInterface, session: PaneSession, closedKey?: string): Promise<void> {
     await inFlight(session, async (isOvertaken) => {
         const queue = await readQueue($);
         const before = await read($, queueState);
@@ -435,7 +444,7 @@ async function refresh($: EngineInterface, session: PaneSession): Promise<void> 
         if (isOvertaken()) {
             return;
         }
-        const reselected = reselect(before, queue, selected);
+        const reselected = reselect(before, queue, selected, closedKey);
         await update($, queueState, () => queue);
         await update($, selectedState, () => reselected);
         if (reselected.kind === 'note' && (selected.kind === 'none' || selected.key !== reselected.key)) {
@@ -511,6 +520,22 @@ async function work($: EngineInterface, session: PaneSession, row: NoteRow): Pro
     await update($, statusState, () => line);
 }
 
+// Runs an action on a note (`w`, `d`, `x`, Enter on a row) unless one is still running, in which case the press is
+// ignored. Until an action settles, the rows on screen are about to change, and a second press would act on them as
+// drawn: of two quick `d` presses on identical adjacent notes, the second's guard matches the twin that moved up and
+// closes it too. The check and the set are one synchronous step, so two presses cannot both pass.
+async function actAlone(session: PaneSession, action: () => Promise<void>): Promise<void> {
+    if (session.isActing) {
+        return;
+    }
+    session.isActing = true;
+    try {
+        await action();
+    } finally {
+        session.isActing = false;
+    }
+}
+
 async function workOnSelected($: EngineInterface, session: PaneSession): Promise<void> {
     const row = await selectedRow($);
     if (row !== undefined) {
@@ -520,7 +545,8 @@ async function workOnSelected($: EngineInterface, session: PaneSession): Promise
 
 // `d` and `x`: closes the selected note, guarded by the text and number the pane drew, so a queue that changed
 // since the read is refused instead of losing another note. The text goes exactly as the read parsed it: a trimmed
-// copy would not match a note that ends in whitespace. The queue is read again either way.
+// copy would not match a note that ends in whitespace. The queue is read again either way, after a close with the
+// closed note named, so the selection moves on to the row now at its place even when a twin of it is still listed.
 async function closeSelected($: EngineInterface, session: PaneSession, mode: 'done' | 'drop'): Promise<void> {
     const row = await selectedRow($);
     if (row === undefined) {
@@ -529,7 +555,7 @@ async function closeSelected($: EngineInterface, session: PaneSession, mode: 'do
     const closed = await runEngine($, [mode, '--if', row.text, String(row.position)]);
     const line = closed.ok ? closed.stdout : `later: ${closed.reason}`;
     await update($, statusState, () => line);
-    await refresh($, session);
+    await refresh($, session, closed.ok ? row.key : undefined);
 }
 
 // `j` and `k`: the selection one note down or up, nothing past either end. The module's own focus move never reaches
@@ -564,20 +590,23 @@ async function focusSelected($: EngineInterface): Promise<void> {
     }
 }
 
-// Enter in the input. The input closes, and an empty value parks nothing. Any other is parked as `/later <text>`
-// parks it, the status line showing `later: parking...` and then the line the command prints (C9), and the queue is
-// read again. Either way the ring goes back to the selected row, which a first note in an empty queue has become,
-// unless an `a` pressed during a long park has opened the input again.
+// Enter in the input. The input closes and the ring goes back to the selected row at once (C18): the park takes up to
+// 40 seconds in fork mode, and meanwhile Enter would press whichever row the surface left the ring on. An empty value
+// parks nothing. Any other is parked as `/later <text>` parks it, the status line showing `later: parking...` and
+// then the line the command prints (C9), and the queue is read again; a first note in an empty queue becomes the
+// selected row, and the re-read moves the ring onto it, unless an `a` pressed during the park has opened the input
+// again.
 async function submitNote($: EngineInterface, session: PaneSession, mode: RewriteMode, value: string): Promise<void> {
     const typed = collapse(value);
     await update($, addingState, () => false);
-    if (typed !== '') {
-        await update($, statusState, () => 'later: parking...');
-        const parked = await park($, mode, typed);
-        await update($, statusState, () => parked.line);
-        await refresh($, session);
-    }
     await focusSelected($);
+    if (typed === '') {
+        return;
+    }
+    await update($, statusState, () => 'later: parking...');
+    const parked = await park($, mode, typed);
+    await update($, statusState, () => parked.line);
+    await refresh($, session);
 }
 
 // The pane's first line: the queue's label and count, or why the queue could not be read.
@@ -639,12 +668,14 @@ async function drawPane(
                         key={row.key}
                         plain
                         {...(isSelected ? ({ autoFocus: true } as const) : {})}
-                        onPress={async () => {
-                            await update($, selectedState, () => selectionOf(row));
-                            await work($, session, row);
-                        }}
+                        onPress={() =>
+                            actAlone(session, async () => {
+                                await update($, selectedState, () => selectionOf(row));
+                                await work($, session, row);
+                            })
+                        }
                     >
-                        {`${isSelected ? '> ' : ''}${row.position}. ${row.text} `}
+                        {`${isSelected ? '> ' : '  '}${row.position}. ${row.text} `}
                         <Text dimColor>{`(${row.age})`}</Text>
                     </Button>
                 );
@@ -660,21 +691,21 @@ async function drawPane(
                                 hotkey="w"
                                 plain
                                 label="work on it"
-                                onPress={() => workOnSelected($, session)}
+                                onPress={() => actAlone(session, () => workOnSelected($, session))}
                             />
                             <Button
                                 key="done"
                                 hotkey="d"
                                 plain
                                 label="done"
-                                onPress={() => closeSelected($, session, 'done')}
+                                onPress={() => actAlone(session, () => closeSelected($, session, 'done'))}
                             />
                             <Button
                                 key="drop"
                                 hotkey="x"
                                 plain
                                 label="drop"
-                                onPress={() => closeSelected($, session, 'drop')}
+                                onPress={() => actAlone(session, () => closeSelected($, session, 'drop'))}
                             />
                         </>
                     ) : null}
@@ -700,6 +731,7 @@ export const register: Register = (on, options) => {
     const session: PaneSession = {
         isInteractive: false,
         isPaneOpen: false,
+        isActing: false,
         readsInFlight: 0,
         readsStarted: 0,
         refreshTimer: NO_TIMER,
