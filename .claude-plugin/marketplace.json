@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "akalongman",
+  "description": "Project-agnostic Claude Code plugins maintained by Avtandil Kikabidze.",
+  "owner": {
+    "name": "Avtandil Kikabidze",
+    "url": "https://github.com/akalongman"
+  },
+  "plugins": [
+    {
+      "name": "later",
+      "source": "./plugins/later",
+      "description": "Parking lot for follow-up notes: /later parks a note at once, even mid-turn, after a model has cleaned its text, and alone opens a pane to work through the notes; a terminal command, later, reaches the same queue; a skill lists, closes and drops notes; a session-start line shows the count.",
+      "category": "productivity"
+    }
+  ]
+}

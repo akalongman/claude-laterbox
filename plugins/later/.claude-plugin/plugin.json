@@ -1,0 +1,25 @@
+{
+  "name": "later",
+  "version": "0.1.0",
+  "description": "Parking lot for follow-up notes: /later parks a note at once, even mid-turn, after a model has cleaned its text, and alone opens a pane to work through the notes; a terminal command, later, reaches the same queue; a skill lists, closes and drops notes; a session-start line shows the count.",
+  "author": { "name": "Avtandil Kikabidze", "url": "https://github.com/akalongman" },
+  "repository": "https://github.com/akalongman/claude-plugins",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "rewrite": {
+      "type": "string",
+      "title": "Note rewrite",
+      "description": "How /later cleans a note before storing it: haiku (a small model, given the last few messages), fork (the session's own model over the whole conversation; slow and costly), off (store the typed text).",
+      "options": ["haiku", "fork", "off"],
+      "default": "haiku"
+    },
+    "terminal": {
+      "type": "string",
+      "title": "Terminal command",
+      "description": "link: at session start, keep a later command in ~/.local/bin that runs this plugin; off: remove the link this plugin made and add none.",
+      "options": ["link", "off"],
+      "default": "link"
+    }
+  }
+}

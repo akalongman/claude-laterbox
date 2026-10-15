@@ -1,0 +1,18 @@
+{
+  "description": "Shows the parked-note count and keeps the terminal command linked when a session starts; loads the /later command module",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/later.sh\" session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "modules": ["./register.tsx"]
+}

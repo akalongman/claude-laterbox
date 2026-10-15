@@ -1,0 +1,14 @@
+{
+    "extends": "./.claude-plugin/types/tsconfig.json",
+    "compilerOptions": {
+        "strict": true,
+        "noUncheckedIndexedAccess": true,
+        "noUnusedLocals": true,
+        "noUnusedParameters": true,
+        "exactOptionalPropertyTypes": true,
+        "noFallthroughCasesInSwitch": true,
+        "forceConsistentCasingInFileNames": true,
+        "verbatimModuleSyntax": true
+    },
+    "include": ["hooks/**/*.ts", "hooks/**/*.tsx", "types/**/*.d.ts"]
+}
