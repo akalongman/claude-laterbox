@@ -7,7 +7,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/later.sh\" session-start",
+            "shell": "bash",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/later.sh\" session-start",
             "timeout": 10
           }
         ]

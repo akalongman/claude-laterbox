@@ -558,12 +558,18 @@ const PANE_PROPS = {
 async function openPane($: Engine, surface: (typeof SURFACES)[number]): Promise<PaneUi> {
     await $.session.start(SESSION);
     await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
-    return $.ui.mount({ plugin: 'later', surface, component: 'Pane', requestId: PANE_ID, props: PANE_PROPS });
+    return $.ui.mount({ plugin: 'laterbox', surface, component: 'Pane', requestId: PANE_ID, props: PANE_PROPS });
 }
 
 // The person moving the pane's ring, as Tab or an arrow does.
 function personFocus($: Engine, element: string): Promise<UiFocusResult> {
-    return $.ui.focus({ component: 'Pane', requestId: PANE_ID, plugin: 'later', element, origin: { kind: 'person' } });
+    return $.ui.focus({
+        component: 'Pane',
+        requestId: PANE_ID,
+        plugin: 'laterbox',
+        element,
+        origin: { kind: 'person' },
+    });
 }
 
 async function shows(ui: PaneUi, text: string): Promise<boolean> {
@@ -698,7 +704,7 @@ for (const surface of SURFACES) {
         });
 
         for (const [name, answers, reason] of [
-            ['rejected', { draftRead: 'deny' }, 'later: $.prompt.read: no prompt box in this test'],
+            ['rejected', { draftRead: 'deny' }, 'laterbox: $.prompt.read: no prompt box in this test'],
             ['refused', { fill: { isFilled: false } }, 'refused'],
         ] as const) {
             test(`a fill refused (${name}) keeps the pane open and says why`, async ($, on) => {

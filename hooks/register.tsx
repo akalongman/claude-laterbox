@@ -69,13 +69,13 @@ function hasInput(e: RenderInput<'Pane'>): e is RenderInput<'Pane', InputSurface
     return TAKES_INPUT[e.surface];
 }
 
-const queueState = atom({ plugin: 'later', key: 'queue' } as const, {
+const queueState = atom({ plugin: 'laterbox', key: 'queue' } as const, {
     kind: 'failed',
     reason: 'the queue was not read yet',
 });
-const selectedState = atom({ plugin: 'later', key: 'selected' } as const, { kind: 'none' });
-const addingState = atom({ plugin: 'later', key: 'isAdding' } as const, false);
-const statusState = atom({ plugin: 'later', key: 'status' } as const, '');
+const selectedState = atom({ plugin: 'laterbox', key: 'selected' } as const, { kind: 'none' });
+const addingState = atom({ plugin: 'laterbox', key: 'isAdding' } as const, false);
+const statusState = atom({ plugin: 'laterbox', key: 'status' } as const, '');
 
 // A note line of `later.sh rows`: `note\t<position>\t<age>\t<text>`. The text runs to the end of the line and may
 // hold tabs (and a carriage return, from a hand-edited file), so only the first three tabs split.

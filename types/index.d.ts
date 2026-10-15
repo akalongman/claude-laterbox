@@ -14,6 +14,6 @@ export type Selection = { readonly kind: 'none' } | { readonly kind: 'note'; rea
 
 declare module 'claude-code' {
     interface PluginState {
-        later: { queue: Queue; selected: Selection; isAdding: boolean; status: string };
+        laterbox: { queue: Queue; selected: Selection; isAdding: boolean; status: string };
     }
 }

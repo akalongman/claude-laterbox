@@ -130,25 +130,24 @@ Uninstalling deletes the plugin's data folder and leaves
 Test the working copy in one session without installing it:
 
 ```bash
-claude --plugin-dir ./plugins/later
+claude --plugin-dir .
 ```
 
 Check before pushing:
 
 ```bash
 claude plugin validate . --strict
-claude plugin validate ./plugins/later --strict
-claude plugin test ./plugins/later
-bash plugins/later/tests/later.test.sh
-shellcheck plugins/later/scripts/later plugins/later/scripts/later.sh plugins/later/tests/*.sh
+claude plugin test .
+bash tests/later.test.sh
+shellcheck scripts/later scripts/later.sh tests/*.sh
 ```
 
 Once a session has loaded the plugin from this folder, which writes the
-declarations it needs to `plugins/later/.claude-plugin/types/`, the command
-`npx -y -p typescript@5.9.3 tsc -p plugins/later --noEmit` type-checks the mod.
+declarations it needs to `.claude-plugin/types/`, the command
+`npx -y -p typescript@5.9.3 tsc -p . --noEmit` type-checks the mod.
 
 A change reaches installed copies only when `version` in
-`plugins/later/.claude-plugin/plugin.json` changes, so a release bumps it.
+`.claude-plugin/plugin.json` changes, so a release bumps it.
 
 ## License
 

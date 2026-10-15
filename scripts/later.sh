@@ -32,7 +32,7 @@ SCAN_DEPTH=6
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/later/v2"
 
 # The terminal link step's notices (session-start only).
-NOTICE_ADDED='later: added the terminal command ~/.local/bin/later; set later.terminal to off in /config to remove it.'
+NOTICE_ADDED='later: added the terminal command ~/.local/bin/later; set laterbox.terminal to off in /config to remove it.'
 NOTICE_REMOVED='later: removed the terminal command ~/.local/bin/later.'
 NOTICE_REFUSED='later: ~/.local/bin/later exists and was not made by this plugin, so the terminal command was not added; remove it and start a new session to get it.'
 NOTICE_PATH="later: ~/.local/bin is not on PATH in this session, so a terminal may not find later; add it to PATH in your shell's startup file."

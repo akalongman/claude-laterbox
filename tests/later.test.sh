@@ -303,7 +303,7 @@ assert_eq "$(printf '%s\n' "$out" | sed 's/,.*//')" "later: 13 parked in $(basen
 # Every case has its own HOME, with the data folder inside it.
 
 ROOT="$(cd "$HERE/.." && pwd -P)"
-ADDED='later: added the terminal command ~/.local/bin/later; set later.terminal to off in /config to remove it.'
+ADDED='later: added the terminal command ~/.local/bin/later; set laterbox.terminal to off in /config to remove it.'
 REMOVED='later: removed the terminal command ~/.local/bin/later.'
 REFUSED='later: ~/.local/bin/later exists and was not made by this plugin, so the terminal command was not added; remove it and start a new session to get it.'
 NOPATH="later: ~/.local/bin is not on PATH in this session, so a terminal may not find later; add it to PATH in your shell's startup file."
