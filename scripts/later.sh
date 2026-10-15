@@ -356,9 +356,177 @@ cmd_all() {
     printf '%3d open in %d queues\n' "$total" "$queues"
 }
 
+# --- JSON, without jq --------------------------------------------------
+# The hook reads its input and writes its output in plain bash: no process
+# per character, and the same bytes out under a UTF-8 or a C locale. Every
+# delimiter the code looks for is ASCII, which never occurs inside a UTF-8
+# multibyte character, and a ${s:n} offset only ever skips ASCII text.
+# Replacements sit in quoted variables in an unquoted assignment, which
+# bash 3.2, 4 and 5.2 (patsub_replacement) all read literally.
+
+JSON_WS=$' \t\n\r'
+# The bytes 0x01 to 0x1f, which a string literal holds only escaped. Listed,
+# like the next two, because a class or a range in a bracket follows the
+# locale ([[:cntrl:]] also holds DEL, and U+0080 to U+009F under UTF-8).
+JSON_CTL=$'\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037'
+JSON_HEX='0123456789ABCDEFabcdef'
+JSON_BARE='0123456789.eE+trufalsn-'   # every character of a number or literal
+JSON_BARE_RE='^(true|false|null|-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?)$'
+
+# Sets REPLY to <text> as a JSON string literal, quotes included: " and \
+# escaped, \b \f \n \r \t for those controls, \u00XX for the other bytes
+# below 0x20, every other byte unchanged.
+json_string() { # text
+    local s=$1 bs=\\ q='"' i=1 c e
+    s=${s//"$bs"/"$bs$bs"}
+    s=${s//"$q"/"$bs$q"}
+    case $s in *["$JSON_CTL"]*)
+        while [ "$i" -le 31 ]; do
+            c=${JSON_CTL:i-1:1}
+            case $s in *"$c"*)
+                case $i in
+                    8) e='\b' ;; 9) e='\t' ;; 10) e='\n' ;; 12) e='\f' ;; 13) e='\r' ;;
+                    *) printf -v e '\\u%04x' "$i" ;;
+                esac
+                s=${s//"$c"/"$e"} ;;
+            esac
+            i=$((i + 1))
+        done
+    esac
+    REPLY=$q$s$q
+}
+
+# Consumes the string literal at the start of the caller's $s, which begins
+# with its opening quote, and sets REPLY to its decoded value. \uXXXX is
+# written as UTF-8, a surrogate pair as one character, a lone surrogate as
+# U+FFFD; \u0000 is dropped, as $(jq -r ...) dropped it in 0.1.0. Fails on
+# an unterminated literal, an unknown escape or a raw control character.
+json_take_string() {
+    local out='' chunk e hex cp lo
+    s=${s:1}
+    while :; do
+        # The text up to the next quote or backslash; none: unterminated.
+        chunk=${s%%[\"\\]*}
+        [ "$chunk" != "$s" ] || return 1
+        case $chunk in *["$JSON_CTL"]*) return 1 ;; esac
+        out+=$chunk
+        s=${s#"$chunk"}
+        if [ "${s:0:1}" = '"' ]; then
+            s=${s:1}
+            break
+        fi
+        e=${s:1:1}
+        case $e in
+            \"|\\|/) out+=$e ;;
+            b) out+=$'\b' ;;
+            f) out+=$'\f' ;;
+            n) out+=$'\n' ;;
+            r) out+=$'\r' ;;
+            t) out+=$'\t' ;;
+            u) ;;
+            *) return 1 ;;
+        esac
+        if [ "$e" != u ]; then
+            s=${s:2}
+            continue
+        fi
+        hex=${s:2:4}
+        case $hex in [$JSON_HEX][$JSON_HEX][$JSON_HEX][$JSON_HEX]) ;; *) return 1 ;; esac
+        cp=$((16#$hex)); s=${s:6}
+        if [ "$cp" -ge 55296 ] && [ "$cp" -le 57343 ]; then
+            # A high surrogate (D800 to DBFF) followed by a low one (DC00 to
+            # DFFF) is one character above U+FFFF.
+            hex=${s:2:4}
+            case ${s:0:2}$hex in
+                '\u'[dD][cdefCDEF][$JSON_HEX][$JSON_HEX]) lo=$((16#$hex)) ;;
+                *) lo=0 ;;
+            esac
+            if [ "$cp" -le 56319 ] && [ "$lo" -ne 0 ]; then
+                cp=$(( 65536 + ((cp - 55296) << 10) + (lo - 56320) )); s=${s:6}
+            else
+                cp=65533
+            fi
+        fi
+        if [ "$cp" -eq 0 ]; then
+            continue
+        elif [ "$cp" -lt 128 ]; then
+            printf -v e '\\%03o' "$cp"
+        elif [ "$cp" -lt 2048 ]; then
+            printf -v e '\\%03o\\%03o' $(( 192 | (cp >> 6) )) $(( 128 | (cp & 63) ))
+        elif [ "$cp" -lt 65536 ]; then
+            printf -v e '\\%03o\\%03o\\%03o' $(( 224 | (cp >> 12) )) $(( 128 | ((cp >> 6) & 63) )) $(( 128 | (cp & 63) ))
+        else
+            printf -v e '\\%03o\\%03o\\%03o\\%03o' $(( 240 | (cp >> 18) )) $(( 128 | ((cp >> 12) & 63) )) \
+                $(( 128 | ((cp >> 6) & 63) )) $(( 128 | (cp & 63) ))
+        fi
+        # shellcheck disable=SC2059  # the format is the octal escapes
+        printf -v e "$e"
+        out+=$e
+    done
+    REPLY=$out
+}
+
+# Sets REPLY to the decoded value of the top-level string member <key> of
+# <json>; empty when <key> is absent or its value is not a string, or when
+# <json> is not one well-formed JSON object. Members of nested objects and
+# arrays are skipped, never matched. A key given twice takes its last value,
+# as jq did in 0.1.0. Fails whenever REPLY is empty for one of those reasons.
+json_field() { # json key
+    local s=$1 key=$2 stack='' want=value name='' hit='' found='' closed='' w t
+    # stack holds the closer of each open object (}) or array (]); want is
+    # the token the grammar allows next. Any token it does not allow ends the
+    # scan with closed unset.
+    w=${s%%[!"$JSON_WS"]*}; s=${s#"$w"}
+    [ "${s:0:1}" = '{' ] || s=''
+    while [ -n "$s" ]; do
+        t=${s:0:1}
+        case $want:$t in
+            value:'{'|value:'['|first_value:'{'|first_value:'[')
+                [ "$stack" = '}' ] && [ "$name" = "$key" ] && hit=''
+                if [ "$t" = '{' ]; then stack+='}'; want=first_key; else stack+=']'; want=first_value; fi
+                s=${s:1} ;;
+            first_key:'}'|first_value:']'|after_value:'}'|after_value:']')
+                [ "${stack#"${stack%?}"}" = "$t" ] || break
+                stack=${stack%?}; s=${s:1}; want=after_value
+                if [ -z "$stack" ]; then
+                    # The top-level object is closed: only whitespace may follow.
+                    w=${s%%[!"$JSON_WS"]*}; s=${s#"$w"}
+                    [ -z "$s" ] && closed=1
+                    break
+                fi ;;
+            after_key:':')
+                s=${s:1}; want=value ;;
+            after_value:',')
+                s=${s:1}
+                if [ "${stack#"${stack%?}"}" = '}' ]; then want=key; else want=value; fi ;;
+            first_key:'"'|key:'"')
+                json_take_string || break
+                name=$REPLY; want=after_key ;;
+            value:'"'|first_value:'"')
+                json_take_string || break
+                if [ "$stack" = '}' ] && [ "$name" = "$key" ]; then hit=1; found=$REPLY; fi
+                want=after_value ;;
+            value:*|first_value:*)
+                t=${s%%[!"$JSON_BARE"]*}
+                [[ $t =~ $JSON_BARE_RE ]] || break
+                [ "$stack" = '}' ] && [ "$name" = "$key" ] && hit=''
+                s=${s#"$t"}; want=after_value ;;
+            *)
+                break ;;
+        esac
+        w=${s%%[!"$JSON_WS"]*}; s=${s#"$w"}
+    done
+    if [ -n "$closed" ] && [ -n "$hit" ]; then
+        REPLY=$found
+        return 0
+    fi
+    REPLY=''
+    return 1
+}
+
 # How the display reaches the user. Kept in one place: it is the only line
 # that changes if the message has to go into model context instead.
-emit() { jq -n --arg m "$1" '{systemMessage: $m}'; }
+emit() { json_string "$1"; printf '{"systemMessage":%s}\n' "$REPLY"; }
 
 # Base 10 forced: a hand-edited "08" is not octal, and "010" is ten.
 num_or_zero() { case "$1" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$((10#$1))" ;; esac; }
@@ -451,12 +619,13 @@ terminal_link() {
 }
 
 cmd_session_start() {
-    command -v jq >/dev/null 2>&1 || return 0
-    local input cwd src agent file rows='' count sf='' shown=0 digest=0 t floor msg='' notices bad
-    input=$(cat)
-    cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)
-    src=$(printf '%s' "$input" | jq -r '.source // empty' 2>/dev/null)
-    agent=$(printf '%s' "$input" | jq -r '.agent_id // empty' 2>/dev/null)
+    local input='' cwd src agent file rows='' count sf='' shown=0 digest=0 t floor msg='' notices bad
+    # The whole input, by the read builtin: no process. read fails at the end
+    # of the input, which is where it stops.
+    IFS= read -r -d '' input
+    json_field "$input" cwd; cwd=$REPLY
+    json_field "$input" source; src=$REPLY
+    json_field "$input" agent_id; agent=$REPLY
     [ -n "$cwd" ] && [ "$src" = 'startup' ] && [ -z "$agent" ] || return 0
     [ "${CLAUDE_CODE_ENTRYPOINT:-}" = 'cli' ] || return 0
 

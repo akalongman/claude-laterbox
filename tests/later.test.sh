@@ -18,6 +18,13 @@ ENGINE="$HERE/../scripts/later.sh"
 # system folders, so the engine cannot lean on a tool the user installed.
 ENGINE_PATH="${LATER_TEST_ENGINE_PATH:-$PATH}"
 
+# The engine needs no jq (spec R5.1). Every engine run finds this one first:
+# it records the call and fails, and the last case asserts it was never called.
+JQ_TRAP="$(mk_tmpdir)"
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >> "${0%/*}/calls"' 'exit 127' > "$JQ_TRAP/jq"
+chmod +x "$JQ_TRAP/jq"
+ENGINE_PATH="$JQ_TRAP:$ENGINE_PATH"
+
 # Why Git Bash skips every case that makes a symbolic link.
 NO_LINKS="Git Bash's ln -s makes a copy, not a symbolic link"
 
@@ -239,9 +246,15 @@ fi
 # --- session-start ----------------------------------------------------
 
 hook_in() { "$JQ" -n --arg cwd "$1" --arg src "${2:-startup}" '{cwd: $cwd, source: $src, hook_event_name: "SessionStart"}'; }
-ss() { # stdin: hook input; prints the user-visible message
-    ( cd / && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" CLAUDE_CODE_ENTRYPOINT=cli TZ=UTC LATER_NOW="$NOW" PATH="$ENGINE_PATH" bash "$ENGINE" session-start ) | "$JQ" -r '.systemMessage // empty'
+ss_json() { # stdin: hook input; prints the hook's output as it wrote it
+    ( cd / && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" CLAUDE_CODE_ENTRYPOINT=cli TZ=UTC LATER_NOW="$NOW" PATH="$ENGINE_PATH" bash "$ENGINE" session-start )
 }
+ss() { # stdin: hook input; prints the user-visible message
+    ss_json | "$JQ" -r '.systemMessage // empty'
+}
+# <text> as the inside of a JSON string literal, for input written by hand.
+json_inner() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
+is_json() { printf '%s' "$1" | "$JQ" -e . >/dev/null; }
 
 s="$(mk_repo)"; mkdir -p "$s/deep/er"
 printf '%s\n' '- [ ] old undated' '- [ ] old dated (2026-09-01 08:00)' '- [ ] n3' '- [ ] n4' '- [ ] n5' '- [ ] n6' > "$s/$Q"
@@ -292,12 +305,57 @@ assert_contains "$(printf '%s\n' "$out" | sed -n 1p)" "xxx..." "clip is marked"
 assert_eq "$(printf '%s\n' "$out" | sed -n 3p | count_bytes)" "$(( 4 + 100 + 8 + 1 ))" "list row clipped to 100 characters"
 assert_contains "$(lt "$lg" list)" "$long" "list prints the note in full"
 
+# Spec R5.1: the output is valid JSON whatever the notes hold. The queue is
+# written directly, because add collapses tabs and carriage returns.
+rt="$(mk_repo)"
+rt1='say "hi" to C:\temp, \"quoted\" and \\ twice'
+rt2="a tab${T}and a control byte "$'\001'" inside"
+rt3='Georgian შენიშვნა and an emoji 🎉'
+rt4="a carriage"$'\r'"return mid note"
+printf -- '- [ ] %s (2026-10-04 14:00)\n' "$rt1" "$rt2" "$rt3" "$rt4" > "$rt/$Q"
+out="$(hook_in "$rt" | ss_json)"
+assert_ok "the output parses for notes holding quotes, backslashes, controls and non-ASCII text" is_json "$out"
+msg="$(printf '%s' "$out" | "$JQ" -r '.systemMessage // empty')"
+assert_eq "$(printf '%s\n' "$msg" | sed -n 1p)" "later: 4 parked in $(basename "$rt"), 4 new: $rt1; $rt2; $rt3, +1 more" "the count line holds the note texts exactly"
+i=0
+for n in "$rt1" "$rt2" "$rt3" "$rt4"; do
+    i=$((i + 1))
+    assert_contains "$msg" $'\n'" $i. $n (" "the list holds note $i exactly"
+done
+
+# Review Focus 5: the top-level cwd is used, decoded, also after a nested
+# object that holds a cwd of its own.
+if [ "$PLATFORM" = gitbash ]; then
+    skip "a cwd holding a backslash and a double quote: Windows folder names cannot hold either"
+else
+    wq="$(mk_tmpdir)/back\\slash \"quoted\""
+    mv "$(mk_repo)" "$wq"
+    printf '%s\n' '- [ ] in an odd folder' > "$wq/$Q"
+    out="$(printf '{"model":{"cwd":"/wrong"},"source":"startup","cwd":"%s","hook_event_name":"SessionStart"}' "$(json_inner "$wq")" | ss)"
+    assert_eq "$(printf '%s\n' "$out" | sed -n 1p)" "later: 1 parked in back\\slash \"quoted\"" "a nested cwd is skipped, the top-level one decoded"
+fi
+# \u escapes: one ASCII, one above U+007F and a surrogate pair. The nested
+# cwd after the top-level one is skipped too.
+uq="$(mk_tmpdir)/esc-Aა😀"
+mv "$(mk_repo)" "$uq"
+printf '%s\n' '- [ ] spelled with escapes' > "$uq/$Q"
+out="$(printf '{"source":"startup","cwd":"%s/esc-\\u0041\\u10D0\\ud83d\\ude00","extra":[{"cwd":"/wrong"}]}' "$(json_inner "${uq%/*}")" | ss)"
+assert_eq "$(printf '%s\n' "$out" | sed -n 1p)" "later: 1 parked in esc-Aა😀" "\\u escapes in the cwd decode, a surrogate pair included"
+# A key given twice takes its last value, as jq did in 0.1.0.
+out="$(printf '{"cwd":"/nonexistent","source":"startup","cwd":"%s"}' "$(json_inner "$uq")" | ss)"
+assert_eq "$(printf '%s\n' "$out" | sed -n 1p)" "later: 1 parked in esc-Aა😀" "a cwd given twice takes its last value"
+
 # Silent paths: every one exits 0 and prints nothing.
 assert_eq "$(hook_in "$s" resume | ss)" "" "resume is ignored"
 assert_eq "$(hook_in "$s" compact | ss)" "" "compact is ignored"
 assert_eq "$("$JQ" -n --arg cwd "$s" '{cwd: $cwd, source: "startup", agent_id: "a1"}' | ss)" "" "subagent is ignored"
 assert_eq "$(printf 'not json' | ss)" "" "malformed input is ignored"
 assert_eq "$(printf '' | ss)" "" "empty input is ignored"
+sj="$(json_inner "$s")"
+assert_eq "$(printf '{"cwd":"%s","source":"startup"' "$sj" | ss)" "" "an unclosed object is ignored"
+assert_eq "$(printf '[{"cwd":"%s","source":"startup"}]' "$sj" | ss)" "" "a top-level array is ignored"
+assert_eq "$(printf '{"cwd":"%s","source":"startup"} {}' "$sj" | ss)" "" "text after the object is ignored"
+assert_eq "$(printf '{"cwd":"%s","source":"startup","cwd":7}' "$sj" | ss)" "" "a cwd whose last value is not a string is ignored"
 assert_eq "$(hook_in "$e" | ss)" "" "no queue file: nothing"
 assert_eq "$(hook_in "$d" | ss)" "" "no open notes: nothing"
 assert_eq "$(hook_in /nonexistent/dir | ss)" "" "missing directory: nothing"
@@ -620,5 +678,8 @@ assert_file "$gr/$Q" "R4: the first add makes the queue"
 assert_eq "$(file_digest "$gr/.git/info/exclude" 2>/dev/null)" "$exclude_before" "R4: .git/info/exclude is byte-identical"
 assert_nofile "$gr/.gitignore" "R4: no .gitignore is made"
 assert_eq "$(file_digest "$gr/.git/config")" "$config_before" "R4: the repository's git configuration is untouched"
+
+# Spec R8.2: no engine run in the whole suite reached for jq.
+assert_nofile "$JQ_TRAP/calls" "no engine run called jq"
 
 finish
