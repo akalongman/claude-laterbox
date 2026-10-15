@@ -13,6 +13,8 @@ source "$HERE/assert.sh"
 # A run from a hook's environment must not link into a real data folder, take
 # the queue name from a real setting or touch the real stored copy of it.
 unset CLAUDE_PLUGIN_DATA CLAUDE_PLUGIN_OPTION_TERMINAL CLAUDE_PLUGIN_OPTION_FILE XDG_STATE_HOME
+# The lock cases choose the lock themselves.
+unset LATER_NO_FLOCK
 ENGINE="$HERE/../scripts/later.sh"
 # The PATH of every engine run, front-end runs included. CI narrows it to the
 # system folders, so the engine cannot lean on a tool the user installed.
@@ -181,8 +183,8 @@ wait
 assert_eq "$(grep -c 'racer' "$r/$Q")" "8" "no append lost during rewrites"
 assert_eq "$(grep -c '^- \[x\]' "$r/$Q")" "8" "every done landed"
 
-# The same race where flock is missing (spec R5.2): LATER_NO_FLOCK=1 makes the
-# engine lock with a folder, as on macOS and Git Bash, also where flock exists.
+# The same race on the lock folder of macOS and Git Bash (spec R5.2):
+# LATER_NO_FLOCK=1 makes the engine take it on Linux too.
 r="$(mk_repo)"
 for i in 1 2 3 4 5 6 7 8; do lt "$r" add "seed $i" >/dev/null; done
 for i in 1 2 3 4 5 6 7 8; do LATER_NO_FLOCK=1 lt "$r" add "racer $i" >/dev/null & LATER_NO_FLOCK=1 lt "$r" done 1 >/dev/null & done
@@ -191,14 +193,16 @@ assert_eq "$(grep -c 'racer' "$r/$Q")" "8" "no flock: no append lost during rewr
 assert_eq "$(grep -c '^- \[x\]' "$r/$Q")" "8" "no flock: every done landed"
 assert_nofile "$(lock_of "$r")" "no flock: the last writer removes the lock folder"
 
-# --- the lock folder, where flock is missing ---------------------------
-# Every case runs with LATER_NO_FLOCK=1 and removes the lock folder it made.
+# --- the lock folder ----------------------------------------------------
+# The lock of macOS and Git Bash. A case reaches it with LATER_NO_FLOCK=1 or
+# with an OSTYPE that is not Linux's, and removes the lock folders it made.
 
 LOCKED='later: the queue is locked by another writer'
-# "<status> <seconds>" on the first line, then the output of add without flock.
+# "<status> <seconds>" on the first line, then the output of add. The
+# caller's prefix assignments (LATER_NO_FLOCK, OSTYPE) reach the engine.
 timed_add() { # dir note
     local t0=$SECONDS out status
-    out="$(LATER_NO_FLOCK=1 lt "$1" add "$2" 2>&1)"; status=$?
+    out="$(lt "$1" add "$2" 2>&1)"; status=$?
     printf '%s %s\n%s\n' "$status" "$((SECONDS - t0))" "$out"
 }
 between() { [ "$3" -ge "$1" ] && [ "$3" -le "$2" ]; } # low high n
@@ -206,17 +210,22 @@ between() { [ "$3" -ge "$1" ] && [ "$3" -le "$2" ]; } # low high n
 # A live holder's folder, and a folder whose holder has not written its id
 # yet: the writer waits, then refuses, and removes neither. A file in the
 # folder's place is no other writer: after the wait, the write runs unlocked.
-# The three run at once, so the suite waits once.
+# Off Linux the folder is the lock also with flock on the PATH, because the
+# platform chooses the lock, not the PATH: under OSTYPE=darwin23 a held
+# folder refuses the writer. The four run at once, so the suite waits once.
 held="$(mk_repo)"; lt "$held" add before the holder >/dev/null
 mkdir -p "$(lock_of "$held")"; printf '%s\n' "$$" > "$(lock_of "$held")/pid"
 young="$(mk_repo)"; lt "$young" add before the holder >/dev/null
 mkdir -p "$(lock_of "$young")"
 occupied="$(mk_repo)"; : > "$(lock_of "$occupied")"
-held_before="$(file_digest "$held/$Q")"; young_before="$(file_digest "$young/$Q")"
+mac="$(mk_repo)"; lt "$mac" add before the holder >/dev/null
+mkdir -p "$(lock_of "$mac")"; printf '%s\n' "$$" > "$(lock_of "$mac")/pid"
+held_before="$(file_digest "$held/$Q")"; young_before="$(file_digest "$young/$Q")"; mac_before="$(file_digest "$mac/$Q")"
 res="$(mk_tmpdir)"
-timed_add "$held" refused > "$res/held" &
-timed_add "$young" refused > "$res/young" &
-timed_add "$occupied" "past a file" > "$res/occupied" &
+LATER_NO_FLOCK=1 timed_add "$held" refused > "$res/held" &
+LATER_NO_FLOCK=1 timed_add "$young" refused > "$res/young" &
+LATER_NO_FLOCK=1 timed_add "$occupied" "past a file" > "$res/occupied" &
+OSTYPE=darwin23 timed_add "$mac" refused > "$res/mac" &
 wait
 read -r status secs < "$res/held"
 assert_eq "$(sed 1d "$res/held")" "$LOCKED" "no flock: a live holder's lock refuses the writer"
@@ -233,12 +242,29 @@ assert_nofile "$(lock_of "$young")/pid" "no flock: a refused writer writes no id
 read -r status secs < "$res/occupied"
 assert_eq "$(sed 1d "$res/occupied")$status" "later: parked -> past a file0" "no flock: a file in the lock folder's place is no other writer"
 assert_ok "no flock: the file in the folder's place is left alone" test -f "$(lock_of "$occupied")"
-rm -rf "$(lock_of "$held")" "$(lock_of "$young")" "$(lock_of "$occupied")"
+read -r status secs < "$res/mac"
+assert_eq "$(sed 1d "$res/mac")$status" "${LOCKED}1" "off Linux: a held folder refuses the writer, also with flock on the PATH"
+assert_eq "$(file_digest "$mac/$Q")" "$mac_before" "off Linux: the refused writer leaves the queue byte-identical"
+assert_eq "$(cat "$(lock_of "$mac")/pid" 2>/dev/null)" "$$" "off Linux: the refused writer leaves the holder's folder and id in place"
+rm -rf "$(lock_of "$held")" "$(lock_of "$young")" "$(lock_of "$occupied")" "$(lock_of "$mac")"
+
+# The counterpart: on Linux with flock on the PATH, flock is the lock, and a
+# held folder does not stop the writer.
+if ( PATH="$ENGINE_PATH"; command -v flock >/dev/null 2>&1 ); then
+    lx="$(mk_repo)"; mkdir -p "$(lock_of "$lx")"; printf '%s\n' "$$" > "$(lock_of "$lx")/pid"
+    out="$(OSTYPE=linux-gnu timed_add "$lx" "past a folder")"
+    read -r status secs <<< "$out"
+    assert_eq "$(printf '%s\n' "$out" | sed 1d)$status" "later: parked -> past a folder0" "on Linux with flock: a held folder does not stop the writer"
+    assert_eq "$(cat "$(lock_of "$lx")/pid" 2>/dev/null)" "$$" "on Linux with flock: the folder is left as it was"
+    rm -rf "$(lock_of "$lx")"
+else
+    skip "on Linux with flock, a held lock folder does not stop add: no flock on the engine's PATH"
+fi
 
 # A folder whose id names no live process (a killed holder) is broken at once.
 : & dead=$!; wait "$dead"
 dl="$(mk_repo)"; mkdir -p "$(lock_of "$dl")"; printf '%s\n' "$dead" > "$(lock_of "$dl")/pid"
-out="$(timed_add "$dl" "after a killed writer")"
+out="$(LATER_NO_FLOCK=1 timed_add "$dl" "after a killed writer")"
 read -r status secs <<< "$out"
 assert_eq "$(printf '%s\n' "$out" | sed 1d)$status" "later: parked -> after a killed writer0" "no flock: a dead holder's lock is broken"
 assert_ok "no flock: a dead holder's lock is broken within 2 seconds (took $secs)" between 0 2 "$secs"
@@ -249,7 +275,7 @@ rm -rf "$(lock_of "$dl")"
 # a zone ten minutes behind UTC, and touch reads the stamp as UTC.
 ag="$(mk_repo)"; mkdir -p "$(lock_of "$ag")"
 TZ=UTC0 touch -t "$(TZ=UTC+0:10 date +%Y%m%d%H%M.%S)" "$(lock_of "$ag")"
-out="$(timed_add "$ag" "past an old lock")"
+out="$(LATER_NO_FLOCK=1 timed_add "$ag" "past an old lock")"
 read -r status secs <<< "$out"
 assert_eq "$(printf '%s\n' "$out" | sed 1d)$status" "later: parked -> past an old lock0" "no flock: a lock folder ten minutes old is broken"
 assert_ok "no flock: an old lock folder is broken within 2 seconds (took $secs)" between 0 2 "$secs"
@@ -262,7 +288,7 @@ if [ "$PLATFORM" = gitbash ]; then
     skip "no flock: a state folder without write permission: Git Bash's chmod u-w leaves the folder writable"
 else
     uw="$(mk_repo)"; chmod u-w "$T_CACHE/later/v2"
-    out="$(timed_add "$uw" "with no room for a lock")"
+    out="$(LATER_NO_FLOCK=1 timed_add "$uw" "with no room for a lock")"
     chmod u+w "$T_CACHE/later/v2"
     read -r status secs <<< "$out"
     assert_eq "$(printf '%s\n' "$out" | sed 1d)$status" "later: parked -> with no room for a lock0" "no flock: a state folder without write permission runs the write unlocked"
