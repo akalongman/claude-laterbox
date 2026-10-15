@@ -159,7 +159,7 @@ assert_contains "$out" "later: dropped -> three" "drop prints the second note"
 assert_eq "$(grep -c -e 'one' -e 'three' "$d/$Q")" "0" "drop removes the lines"
 assert_eq "$(grep -c '^- \[x\]' "$d/$Q")" "2" "closed notes survive a drop"
 assert_eq "$(lt "$d" list)" "later: no parked notes" "queue is empty after closing everything"
-assert_eq "$(find "$d" -maxdepth 1 -name "$Q.*" | count_lines)" "0" "no temp file left behind"
+assert_eq "$(find "$d" -mindepth 1 -maxdepth 1 ! -name .git ! -name README.md ! -name "$Q" | count_lines)" "0" "no temp file left behind"
 
 if [ "$PLATFORM" = gitbash ]; then
     skip "rewrite keeps the file mode: Git Bash's chmod cannot set mode 640"
@@ -347,6 +347,50 @@ assert_contains "$(lt "$gq" list)" "$(basename "$gq"): 1 parked" "refused --if f
 assert_eq "$(lt "$rw" done --if 'Check the S3 retry path' 1)" "later: done -> Check the S3 retry path" "--if compares the text without its stamp"
 assert_eq "$(lt "$rw" drop --if "split${T}here" 2)" "later: dropped -> split${T}here" "--if matches a text holding a tab"
 assert_contains "$(XDG_STATE_HOME="$T_STATE" PATH="$ENGINE_PATH" bash "$ENGINE" 2>&1)" "done [--if <text>] <n>..." "usage names the --if form"
+
+# --- line ends and the byte-order mark --------------------------------
+# Spec R5.3: a queue saved with CRLF line ends, or starting with a UTF-8
+# byte-order mark, reads as an LF file. A rewrite changes only the lines it
+# closes and copies every other line byte for byte.
+
+BOM=$'\357\273\277'
+line_bytes() { sed -n "$2p" "$1" | od -c; } # file n: line n's bytes, its line end included
+
+cr="$(mk_repo)"
+printf '%s\r\n' '# Parked notes (`/later`)' '' '- [ ] Recheck group lecturer policy (2026-09-22 09:00)' > "$cr/$Q"
+assert_eq "$(lt "$cr" list)" "$(basename "$cr"): 1 parked"$'\n'" 1. Recheck group lecturer policy (12d)" "CRLF: list reads the note's date"
+assert_eq "$(lt "$cr" done --if 'Recheck group lecturer policy' 1 2>&1)" "later: done -> Recheck group lecturer policy" "CRLF: --if matches the text without its carriage return"
+assert_eq "$(line_bytes "$cr/$Q" 3)" "$(printf '%s\r\n' '- [x] Recheck group lecturer policy (2026-09-22 09:00)' | od -c)" "CRLF: done --if ticks the box and keeps the line end"
+
+# Review Focus 4: after done and drop, every line the engine did not change
+# keeps its bytes.
+rf="$(mk_repo)"
+printf '%s\r\n' '- [ ] crlf one (2026-10-01 10:00)' '- [ ] crlf two' '- [ ] crlf three' > "$rf/$Q"
+l1="$(line_bytes "$rf/$Q" 1)"; l3="$(line_bytes "$rf/$Q" 3)"
+assert_eq "$(lt "$rf" done 2)" "later: done -> crlf two" "CRLF: done prints the note without its carriage return"
+assert_eq "$(line_bytes "$rf/$Q" 1)" "$l1" "CRLF: done leaves line 1 byte-identical"
+assert_eq "$(line_bytes "$rf/$Q" 3)" "$l3" "CRLF: done leaves line 3 byte-identical"
+assert_eq "$(line_bytes "$rf/$Q" 2)" "$(printf '%s\r\n' '- [x] crlf two' | od -c)" "CRLF: done ticks line 2 and keeps its carriage return"
+l2="$(line_bytes "$rf/$Q" 2)"
+assert_eq "$(lt "$rf" drop 1)" "later: dropped -> crlf one" "CRLF: drop prints the note without its stamp or carriage return"
+assert_eq "$(count_lines < "$rf/$Q")" "2" "CRLF: drop removes the line"
+assert_eq "$(line_bytes "$rf/$Q" 1)" "$l2" "CRLF: drop leaves the closed line byte-identical"
+assert_eq "$(line_bytes "$rf/$Q" 2)" "$l3" "CRLF: drop leaves the last line byte-identical"
+
+# The mark is read on the first line only; done keeps it, and drop removes
+# it with its line.
+bm="$(mk_repo)"
+printf '%s- [ ] first\n- [ ] second\n' "$BOM" > "$bm/$Q"
+assert_eq "$(lt "$bm" list)" "$(basename "$bm"): 2 parked"$'\n'" 1. first (undated)"$'\n'" 2. second (undated)" "BOM: the first line's note is note 1"
+assert_eq "$(lt "$bm" done 1)" "later: done -> first" "BOM: done closes the first line's note"
+assert_eq "$(line_bytes "$bm/$Q" 1)" "$(printf '%s- [x] first\n' "$BOM" | od -c)" "BOM: done keeps the mark"
+bd="$(mk_repo)"
+printf '%s- [ ] first\r\n- [ ] second\r\n' "$BOM" > "$bd/$Q"
+assert_eq "$(lt "$bd" drop --if first 1 2>&1)" "later: dropped -> first" "BOM and CRLF: drop --if matches the first line's note"
+assert_eq "$(od -c < "$bd/$Q")" "$(printf -- '- [ ] second\r\n' | od -c)" "BOM and CRLF: drop removes the first line, mark included, and keeps the next"
+be="$(mk_repo)"
+printf -- '- [ ] before\n%s- [ ] after a mark\n' "$BOM" > "$be/$Q"
+assert_eq "$(lt "$be" list)" "$(basename "$be"): 1 parked"$'\n'" 1. before (undated)" "BOM: a mark after the first line is text"
 
 # --- all --------------------------------------------------------------
 
@@ -842,6 +886,8 @@ for good in "$(printf 'x%.0s' $(seq 1 252)).md" "$(printf 'ა%.0s' $(seq 1 85))
     CLAUDE_PLUGIN_OPTION_FILE="$good" lt "$ug" add at the limit >/dev/null
     assert_file "$ug/$good" "a name of 255 bytes in ${#good} characters is used"
     assert_eq "$(stored_copy)" "$good" "a name of 255 bytes in ${#good} characters is stored"
+    assert_eq "$(lt "$ug" done 1 2>&1)" "later: done -> at the limit" "a name of 255 bytes in ${#good} characters: done 1 succeeds"
+    assert_eq "$(grep -c '^- \[x\] at the limit' "$ug/$good")" "1" "a name of 255 bytes in ${#good} characters: done 1 closes the note"
 done
 
 # session-start stores the setting, or its absence as the default, before

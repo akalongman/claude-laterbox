@@ -80,7 +80,8 @@ const addingState = atom({ plugin: 'laterbox', key: 'isAdding' } as const, false
 const statusState = atom({ plugin: 'laterbox', key: 'status' } as const, '');
 
 // A note line of `later.sh rows`: `note\t<position>\t<age>\t<text>`. The text runs to the end of the line and may
-// hold tabs (and a carriage return, from a hand-edited file), so only the first three tabs split.
+// hold tabs, so only the first three tabs split. The engine drops the carriage return that ends a CRLF line, but a
+// hand-edited note can still hold one inside its text, which `.` matches under the `s` flag.
 const NOTE_LINE = /^note\t(\d+)\t([^\t]*)\t(.*)$/s;
 
 // The default of the `/config` row `laterbox.file`, the queue file used when the option holds no string.
@@ -247,7 +248,8 @@ function rewriteModeOf(value: unknown): RewriteMode {
 }
 
 // The option is read once, at the boundary. A string goes to the engine as it is, the empty string included: the
-// engine validates the name and falls back to the default with a notice. Anything else is the default.
+// engine validates the name and, for an unusable one, falls back to the stored copy of the setting, else to the
+// default; only the session-start message says so. Anything else is the default.
 function queueFileOf(value: unknown): string {
     return typeof value === 'string' ? value : DEFAULT_QUEUE_FILE;
 }
@@ -360,8 +362,9 @@ function paneRows(queue: Queue): number {
     return notesOf(queue).length + 3;
 }
 
-// Only the newline that ends the output is removed: the engine keeps a note's trailing whitespace (spaces, or the
-// carriage return of a CRLF-edited queue), and a guarded close must send the text exactly as the engine holds it.
+// Only the newline that ends the output is removed: the engine keeps a note's trailing spaces and tabs (it drops
+// only the carriage return that ends a CRLF line), and a guarded close must send the text exactly as the engine
+// holds it.
 async function readQueue($: EngineInterface, queueFile: string): Promise<Queue> {
     const listed = await runEngineRaw($, queueFile, ['rows']);
     if (!listed.ok) {

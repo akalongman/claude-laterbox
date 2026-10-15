@@ -53,6 +53,10 @@ NOTICE_BAD_NAME='later: laterbox.file is "%s", which is not a plain file name, s
 OPEN_RE='^[[:space:]]*-[[:space:]]+\[[[:space:]]\][[:space:]]*(.*)$'
 STAMP_RE=' \(([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2})\)$'
 STAMP_LEN=19   # length of " (YYYY-MM-DD HH:MM)"
+# The carriage return of a CRLF line end, and the UTF-8 byte-order mark,
+# EF BB BF, as bytes, so they match under a UTF-8 and a byte locale alike.
+CR=$'\r'
+BOM=$'\357\273\277'
 
 # The bytes 0x80 to 0xBF, which only ever continue a UTF-8 character. Listed,
 # like JSON_CTL below, because a range in a bracket follows the locale.
@@ -228,12 +232,20 @@ stamp_minutes() { # stamp
 
 # One row per open note: "<position>\t<file line>\t<stamp minutes>\t<text>".
 # The minutes are 0 for an undated note; the stamp is stripped from the text.
+# A queue saved with CRLF line ends, or starting with a UTF-8 byte-order
+# mark, reads as an LF file (spec R5.3): one carriage return is dropped from
+# the end of each line, and the mark from the first line, before the match.
+# A carriage return inside a note's text stays. The read builtin reads the
+# file itself: no process, whatever the number of lines (spec R5.6).
 open_notes() {
-    local file="$1" i=0 raw n text mins
+    local file="$1" i=0 n=0 line text mins
     [ -f "$file" ] || return 0
-    while IFS= read -r raw; do
-        n=${raw%%:*}
-        [[ ${raw#*:} =~ $OPEN_RE ]] || continue
+    # The test after read keeps a last line that has no newline.
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        line=${line%"$CR"}
+        [ "$n" -eq 1 ] && line=${line#"$BOM"}
+        [[ $line =~ $OPEN_RE ]] || continue
         text=${BASH_REMATCH[1]}
         mins=0
         if [[ $text =~ $STAMP_RE ]]; then
@@ -242,7 +254,7 @@ open_notes() {
         fi
         i=$((i + 1))
         printf '%s\t%s\t%s\t%s\n' "$i" "$n" "$mins" "$text"
-    done < <(grep -nE "$OPEN_RE" "$file")
+    done < "$file"
 }
 
 row_count() { [ -n "$1" ] && printf '%s\n' "$1" | grep -c . || printf '0\n'; }
@@ -444,15 +456,26 @@ cmd_rows() {
 # close_notes <mode> <file> [--if <text>] <n>...
 # With --if, note <n> must still be exactly <text> under the lock; a note
 # that changed or vanished since a program listed it is refused before any
-# temporary file exists.
+# temporary file exists. The rewrite changes only the lines it closes: done
+# turns the first [ ] into [x] and keeps the rest, a carriage return or a
+# byte-order mark included; drop removes the whole line. awk prints every
+# other line as it read it.
 close_notes() {
     local mode="$1" file="$2"; shift 2
-    local guarded='' expect='' rows count n lines tmp verb target text
+    local guarded='' expect='' rows count n lines tmp verb target dir text
     if [ "${1:-}" = '--if' ]; then
         guarded=1; expect="${2-}"; shift 2
     fi
     # Rewrite beside the real file, so a symlinked queue stays a symlink.
     target=$(readlink -f "$file" 2>/dev/null) || target=$file
+    # The temporary file takes a short name of its own: the queue's name plus
+    # a suffix would pass the 255-byte limit of a name for a queue name of
+    # 249 bytes or more, which usable_queue_name accepts. A target without a
+    # folder part is in the current folder.
+    case $target in
+        */*) dir=${target%/*} ;;
+        *) dir=. ;;
+    esac
     rows=$(open_notes "$file")
     count=$(row_count "$rows")
     for n in "$@"; do
@@ -471,7 +494,7 @@ close_notes() {
     lines=$(for n in "$@"; do
         printf '%s\n' "$rows" | awk -F'\t' -v i="$n" '$1 == i + 0 { print $2 }'
     done | sort -un | tr '\n' ' ')
-    tmp=$(mktemp "$target.XXXXXX") || { echo 'later: cannot write beside the queue' >&2; return 1; }
+    tmp=$(mktemp "$dir/.later-queue.XXXXXX") || { echo 'later: cannot write beside the queue' >&2; return 1; }
     if awk -v lines="$lines" -v mode="$mode" '
             BEGIN { split(lines, a, " "); for (k in a) pick[a[k]] = 1 }
             (NR in pick) { if (mode == "drop") next; sub(/\[[[:space:]]\]/, "[x]") }
