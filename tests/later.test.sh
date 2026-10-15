@@ -69,7 +69,8 @@ lt() { # dir args...
 # and $PWD, this with pwd -P: bash gives both the same physical spelling.
 state_key_of() { sha1_of "$(cd "$1" && pwd -P)/$Q"; } # dir
 # The folder that locks the queue in <dir> whenever the folder lock is taken:
-# off Linux, on Linux where flock is missing, and under LATER_NO_FLOCK=1.
+# off Linux, on Linux where flock is missing or takes no -w (BusyBox's), and
+# under LATER_NO_FLOCK=1.
 lock_of() { printf '%s/later/v2/%s.lock.d\n' "$T_CACHE" "$(state_key_of "$1")"; } # dir
 
 # --- resolution, add, list -------------------------------------------
@@ -244,6 +245,43 @@ assert_eq "$(grep -c 'racer' "$r/$Q")" "8" "no flock: no append lost during rewr
 assert_eq "$(grep -c '^- \[x\]' "$r/$Q")" "8" "no flock: every done landed"
 assert_nofile "$(lock_of "$r")" "no flock: the last writer removes the lock folder"
 
+# The same on Linux with BusyBox's flock first on the PATH, as on Alpine,
+# where bash and git are enough (spec R9.3). That flock takes -s, -x, -n and
+# -u only and answers any other option (-w, --version) with its usage and
+# status 1, so the engine takes the lock folder, as without flock. This one
+# records every call and hands a lock it accepts to the real flock.
+if [ "$PLATFORM" != linux ]; then
+    skip "a BusyBox flock on the PATH: the engine takes flock on Linux only"
+else
+    BB_FLOCK="$(mk_tmpdir)"
+    ( PATH="$ENGINE_PATH"; type -P flock ) > "$BB_FLOCK/real"
+    printf '%s\n' '#!/bin/sh' 'd=${0%/*}' 'printf "%s\n" "$*" >> "$d/calls"' \
+        'for a; do' \
+        '    case $a in' \
+        '        -*[!sxnu]*) echo "Usage: flock [-sxun] FD | { FILE [-c] PROG ARGS }" >&2; exit 1 ;;' \
+        '        -?*) ;;' \
+        '        *) break ;;' \
+        '    esac' \
+        'done' \
+        'read -r real < "$d/real" && exec "$real" "$@"' \
+        'exit 1' > "$BB_FLOCK/flock"
+    chmod +x "$BB_FLOCK/flock"
+    bb_lt() { ENGINE_PATH="$BB_FLOCK:$ENGINE_PATH" lt "$@"; } # dir args...
+    bb="$(mk_repo)"
+    out="$(bb_lt "$bb" add under busybox 2>&1)"; status=$?
+    assert_eq "$out$status" "later: parked -> under busybox0" "BusyBox flock: add parks the note"
+    out="$(bb_lt "$bb" done 1 2>&1)"; status=$?
+    assert_eq "$out$status" "later: done -> under busybox0" "BusyBox flock: done closes the note"
+    assert_ok "BusyBox flock: the engine reached the flock first on its PATH" test -s "$BB_FLOCK/calls"
+    r="$(mk_repo)"
+    for i in 1 2 3 4 5 6 7 8; do bb_lt "$r" add "seed $i" >/dev/null; done
+    for i in 1 2 3 4 5 6 7 8; do bb_lt "$r" add "racer $i" >/dev/null & bb_lt "$r" done 1 >/dev/null & done
+    wait
+    assert_eq "$(grep -c 'racer' "$r/$Q")" "8" "BusyBox flock: no append lost during rewrites"
+    assert_eq "$(grep -c '^- \[x\]' "$r/$Q")" "8" "BusyBox flock: every done landed"
+    assert_nofile "$(lock_of "$r")" "BusyBox flock: the last writer removes the lock folder"
+fi
+
 # --- the lock folder ----------------------------------------------------
 # The lock of macOS and Git Bash. A case reaches it with LATER_NO_FLOCK=1 or
 # with an OSTYPE that is not Linux's, and removes the lock folders it made.
@@ -299,9 +337,9 @@ assert_eq "$(file_digest "$mac/$Q")" "$mac_before" "off Linux: the refused write
 assert_eq "$(cat "$(lock_of "$mac")/pid" 2>/dev/null)" "$$" "off Linux: the refused writer leaves the holder's folder and id in place"
 rm -rf "$(lock_of "$held")" "$(lock_of "$young")" "$(lock_of "$occupied")" "$(lock_of "$mac")"
 
-# The counterpart: on Linux with flock on the PATH, flock is the lock, and a
-# held folder does not stop the writer.
-if ( PATH="$ENGINE_PATH"; command -v flock >/dev/null 2>&1 ); then
+# The counterpart: on Linux with a flock that takes -w on the PATH, flock is
+# the lock, and a held folder does not stop the writer.
+if ( PATH="$ENGINE_PATH"; command -v flock >/dev/null 2>&1 && flock -w 5 --version >/dev/null 2>&1 ); then
     lx="$(mk_repo)"; mkdir -p "$(lock_of "$lx")"; printf '%s\n' "$$" > "$(lock_of "$lx")/pid"
     out="$(OSTYPE=linux-gnu timed_add "$lx" "past a folder")"
     read -r status secs <<< "$out"
@@ -309,7 +347,7 @@ if ( PATH="$ENGINE_PATH"; command -v flock >/dev/null 2>&1 ); then
     assert_eq "$(cat "$(lock_of "$lx")/pid" 2>/dev/null)" "$$" "on Linux with flock: the folder is left as it was"
     rm -rf "$(lock_of "$lx")"
 else
-    skip "on Linux with flock, a held lock folder does not stop add: no flock on the engine's PATH"
+    skip "on Linux with flock, a held lock folder does not stop add: no flock that takes -w on the engine's PATH"
 fi
 
 # A folder whose id names no live process (a killed holder) is broken at once.

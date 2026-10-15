@@ -393,17 +393,23 @@ numbered() {
 # writer of a queue on one machine must take the same lock, and the PATH can
 # differ between its entry points (Homebrew's flock on macOS reaches a
 # terminal, not an app started from the desktop), so the platform chooses
-# the lock, not the PATH: flock on Linux when it is found, the lock folder of
-# with_lock_dir everywhere else (macOS, Git Bash). Left open: on Linux, an
-# entry point whose PATH lacks flock takes the folder while the others take
-# flock, and those two do not exclude each other. Without a state folder
-# there is nowhere to lock, and the command runs unlocked.
+# the lock, not the PATH: flock on Linux when the flock found takes -w, the
+# lock folder of with_lock_dir everywhere else (macOS, Git Bash, and Linux
+# without flock or with BusyBox's, which has no -w). The probe runs that
+# flock with the lock's -w 5 and --version, which locks nothing:
+# util-linux's prints its version and exits 0, BusyBox's prints its usage
+# and exits 1. One process per write, whatever the queue's size. Left open:
+# on Linux, an entry point whose PATH finds no flock that takes -w takes the
+# folder while the others take flock, and those two do not exclude each
+# other. Without a state folder there is nowhere to lock, and the command
+# runs unlocked.
 with_lock() {
     local file="$1" key; shift
     mkdir -p "$STATE_DIR" 2>/dev/null
     [ -d "$STATE_DIR" ] || { "$@"; return; }
     state_key "$file"; key=$REPLY
-    if [ "${LATER_NO_FLOCK:-}" != 1 ] && [[ ${OSTYPE:-} == linux* ]] && command -v flock >/dev/null 2>&1; then
+    if [ "${LATER_NO_FLOCK:-}" != 1 ] && [[ ${OSTYPE:-} == linux* ]] && command -v flock >/dev/null 2>&1 \
+        && flock -w 5 --version >/dev/null 2>&1; then
         (
             flock -w 5 9 || { echo "$LOCKED_MSG" >&2; exit 1; }
             "$@"
@@ -413,7 +419,7 @@ with_lock() {
     fi
 }
 
-# The lock off Linux, and on Linux without flock: the folder <lock>, which
+# The lock off Linux, and on Linux without flock -w: the folder <lock>, which
 # mkdir makes or refuses in one step on every platform. The holder writes its
 # process id into it, runs the command and removes it, whatever the
 # command's status; a killed holder leaves it behind under a dead id. A

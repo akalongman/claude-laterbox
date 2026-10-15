@@ -134,7 +134,8 @@ The engine, `scripts/later.sh`, reads and writes the queue for every entry
 point. It needs bash and git 2.31 or later (`git --version` prints it). Every
 other program it calls ships with Linux, stock macOS and Git for Windows
 alike, so nothing else needs installing. For its lock it uses `flock` on
-Linux when present and a lock folder made with `mkdir` everywhere else.
+Linux when that `flock` takes a wait timeout (util-linux's does, BusyBox's
+does not) and a lock folder made with `mkdir` everywhere else.
 
 | Platform | Setup |
 |---|---|
