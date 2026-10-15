@@ -14,7 +14,7 @@ import type {
 } from 'claude-code';
 import type { NoteRow, Queue, Selection } from '../types/index';
 
-// The three ways a typed note is cleaned before it is stored: the `/config` row `later.rewrite`.
+// The three ways a typed note is cleaned before it is stored: the `/config` row `laterbox.rewrite`.
 type RewriteMode = 'haiku' | 'fork' | 'off';
 
 // What one run of the engine script came to: its standard output, or why it did not list or store.
@@ -28,10 +28,12 @@ type Parked =
     | { readonly ok: true; readonly line: string; readonly stored: string }
     | { readonly ok: false; readonly line: string };
 
-// What the module knows of this session, in one object `register` creates: whether the session is interactive (only
-// then does a bare run open the pane), whether the pane is open, whether an action on a note is running, how many
-// reads of the queue are in flight and how many have started, and the refresh timer (C1).
+// What the module knows of this session, in one object `register` creates: the queue file setting every engine run
+// is given, whether the session is interactive (only then does a bare run open the pane), whether the pane is open,
+// whether an action on a note is running, how many reads of the queue are in flight and how many have started, and
+// the refresh timer (C1).
 type PaneSession = {
+    readonly queueFile: string;
     isInteractive: boolean;
     isPaneOpen: boolean;
     isActing: boolean;
@@ -80,6 +82,9 @@ const statusState = atom({ plugin: 'laterbox', key: 'status' } as const, '');
 // A note line of `later.sh rows`: `note\t<position>\t<age>\t<text>`. The text runs to the end of the line and may
 // hold tabs (and a carriage return, from a hand-edited file), so only the first three tabs split.
 const NOTE_LINE = /^note\t(\d+)\t([^\t]*)\t(.*)$/s;
+
+// The default of the `/config` row `laterbox.file`, the queue file used when the option holds no string.
+const DEFAULT_QUEUE_FILE = 'LATER.local.md';
 
 const ENGINE_TIMEOUT_MS = 10_000;
 const COMPLETION_TIMEOUT_MS = 8_000;
@@ -241,6 +246,12 @@ function rewriteModeOf(value: unknown): RewriteMode {
     return value === 'fork' || value === 'off' ? value : 'haiku';
 }
 
+// The option is read once, at the boundary. A string goes to the engine as it is, the empty string included: the
+// engine validates the name and falls back to the default with a notice. Anything else is the default.
+function queueFileOf(value: unknown): string {
+    return typeof value === 'string' ? value : DEFAULT_QUEUE_FILE;
+}
+
 // The first non-empty line of the engine's stderr, without the `later: ` prefix the engine puts on its own
 // messages (the mod adds that prefix itself), or `fallback` when stderr is empty.
 function reasonOf(stderr: string, fallback: string): string {
@@ -249,12 +260,18 @@ function reasonOf(stderr: string, fallback: string): string {
 }
 
 // Runs the engine by argument vector, no shell, in the session's working directory, so the queue resolves as it
-// does from a terminal. A non-zero exit and a rejection (cannot start, timeout) both become a reason. The standard
-// output comes back exactly as the engine printed it.
-async function runEngineRaw($: EngineInterface, args: ReadonlyArray<string>): Promise<EngineOutcome> {
+// does from a terminal. The queue file setting goes in the environment, over the inherited one: the engine resolves
+// the queue by it and stores it for the terminal command. A non-zero exit and a rejection (cannot start, timeout)
+// both become a reason. The standard output comes back exactly as the engine printed it.
+async function runEngineRaw(
+    $: EngineInterface,
+    queueFile: string,
+    args: ReadonlyArray<string>,
+): Promise<EngineOutcome> {
     try {
         const result = await $.process.run([`${$.plugin.root}/scripts/later.sh`, ...args], {
             timeoutMs: ENGINE_TIMEOUT_MS,
+            env: { CLAUDE_PLUGIN_OPTION_FILE: queueFile },
         });
         if (result.exitCode === 0) {
             return { ok: true, stdout: result.stdout };
@@ -266,8 +283,8 @@ async function runEngineRaw($: EngineInterface, args: ReadonlyArray<string>): Pr
 }
 
 // As runEngineRaw, with trailing whitespace trimmed from the standard output, for output shown as a line.
-async function runEngine($: EngineInterface, args: ReadonlyArray<string>): Promise<EngineOutcome> {
-    const outcome = await runEngineRaw($, args);
+async function runEngine($: EngineInterface, queueFile: string, args: ReadonlyArray<string>): Promise<EngineOutcome> {
+    const outcome = await runEngineRaw($, queueFile, args);
     return outcome.ok ? { ok: true, stdout: outcome.stdout.trimEnd() } : outcome;
 }
 
@@ -345,8 +362,8 @@ function paneRows(queue: Queue): number {
 
 // Only the newline that ends the output is removed: the engine keeps a note's trailing whitespace (spaces, or the
 // carriage return of a CRLF-edited queue), and a guarded close must send the text exactly as the engine holds it.
-async function readQueue($: EngineInterface): Promise<Queue> {
-    const listed = await runEngineRaw($, ['rows']);
+async function readQueue($: EngineInterface, queueFile: string): Promise<Queue> {
+    const listed = await runEngineRaw($, queueFile, ['rows']);
     if (!listed.ok) {
         return { kind: 'failed', reason: listed.reason };
     }
@@ -356,9 +373,9 @@ async function readQueue($: EngineInterface): Promise<Queue> {
 // Parks a typed note: the rewrite, then `add`. The line is what the command prints: the engine's line, followed by
 // ` (typed: <typed>)` when the rewrite changed the text, or the failure template, which keeps the typed text on
 // screen. The pane's add shows the same line.
-async function park($: EngineInterface, mode: RewriteMode, typed: string): Promise<Parked> {
+async function park($: EngineInterface, mode: RewriteMode, queueFile: string, typed: string): Promise<Parked> {
     const stored = await rewrite($, mode, typed);
-    const added = await runEngine($, ['add', stored]);
+    const added = await runEngine($, queueFile, ['add', stored]);
     if (!added.ok) {
         return { ok: false, line: `later: could not park the note (${added.reason}); typed: ${typed}` };
     }
@@ -367,8 +384,8 @@ async function park($: EngineInterface, mode: RewriteMode, typed: string): Promi
 }
 
 // The list as a transcript row, with the hidden note that it holds reminders, not tasks.
-async function listQueue($: EngineInterface): Promise<CommandRunResult> {
-    const listed = await runEngine($, ['list']);
+async function listQueue($: EngineInterface, queueFile: string): Promise<CommandRunResult> {
+    const listed = await runEngine($, queueFile, ['list']);
     return listed.ok ? { text: listed.stdout, context: [LIST_NOTE] } : { text: `later: ${listed.reason}` };
 }
 
@@ -392,7 +409,7 @@ async function inFlight<T>(session: PaneSession, work: (isOvertaken: () => boole
 // a queue nobody asked for at that moment.
 async function openPane($: EngineInterface, session: PaneSession): Promise<CommandRunResult> {
     const queue = await inFlight(session, async () => {
-        const listed = await readQueue($);
+        const listed = await readQueue($, session.queueFile);
         const selected = session.isPaneOpen
             ? reselect(await read($, queueState), listed, await read($, selectedState))
             : firstSelection(listed);
@@ -406,12 +423,12 @@ async function openPane($: EngineInterface, session: PaneSession): Promise<Comma
         .open({ id: PANE, title: 'Parked notes', focus: true, closeOnEscape: true, rows: paneRows(queue) })
         .catch((): undefined => undefined);
     if (opened === undefined) {
-        return listQueue($);
+        return listQueue($, session.queueFile);
     }
     if (!opened.isPlaced) {
         session.isPaneOpen = false;
         await $.ui.close({ id: PANE }).catch((): undefined => undefined);
-        return listQueue($);
+        return listQueue($, session.queueFile);
     }
     session.isPaneOpen = true;
     return {};
@@ -435,7 +452,7 @@ async function ringToRow($: EngineInterface, key: string): Promise<void> {
 // takes an engine run faster than a state write. `closedKey` names the note a `d` or `x` of the pane just closed.
 async function refresh($: EngineInterface, session: PaneSession, closedKey?: string): Promise<void> {
     await inFlight(session, async (isOvertaken) => {
-        const queue = await readQueue($);
+        const queue = await readQueue($, session.queueFile);
         const before = await read($, queueState);
         if (JSON.stringify(queue) === JSON.stringify(before)) {
             return;
@@ -552,7 +569,7 @@ async function closeSelected($: EngineInterface, session: PaneSession, mode: 'do
     if (row === undefined) {
         return;
     }
-    const closed = await runEngine($, [mode, '--if', row.text, String(row.position)]);
+    const closed = await runEngine($, session.queueFile, [mode, '--if', row.text, String(row.position)]);
     const line = closed.ok ? closed.stdout : `later: ${closed.reason}`;
     await update($, statusState, () => line);
     await refresh($, session, closed.ok ? row.key : undefined);
@@ -604,7 +621,7 @@ async function submitNote($: EngineInterface, session: PaneSession, mode: Rewrit
         return;
     }
     await update($, statusState, () => 'later: parking...');
-    const parked = await park($, mode, typed);
+    const parked = await park($, mode, session.queueFile, typed);
     await update($, statusState, () => parked.line);
     await refresh($, session);
 }
@@ -729,6 +746,7 @@ async function drawPane(
 export const register: Register = (on, options) => {
     const mode = rewriteModeOf(options['rewrite']);
     const session: PaneSession = {
+        queueFile: queueFileOf(options['file']),
         isInteractive: false,
         isPaneOpen: false,
         isActing: false,
@@ -771,9 +789,9 @@ export const register: Register = (on, options) => {
     on('command.run', { command: 'later' }, async ($, e) => {
         const typed = collapse(e.args);
         if (typed === '') {
-            return session.isInteractive ? openPane($, session) : listQueue($);
+            return session.isInteractive ? openPane($, session) : listQueue($, session.queueFile);
         }
-        const parked = await park($, mode, typed);
+        const parked = await park($, mode, session.queueFile, typed);
         return parked.ok ? { text: parked.line, context: [parkedNote(parked.stored)] } : { text: parked.line };
     });
 

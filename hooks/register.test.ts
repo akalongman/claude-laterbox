@@ -234,7 +234,7 @@ test('a bare run in a session that is not interactive lists the queue', OFF, asy
     expect(world.runs).toHaveLength(1);
     expect(world.runs[0]?.[0]).toEndWith('/scripts/later.sh');
     expect(world.runs[0]?.slice(1)).toEqual(['list']);
-    expect(world.inits).toEqual([{ timeoutMs: 10_000 }]);
+    expect(world.inits).toEqual([{ timeoutMs: 10_000, env: { CLAUDE_PLUGIN_OPTION_FILE: 'LATER.local.md' } }]);
     expect(world.opens).toEqual([]);
     expect(result.text).toBe(LISTING.trimEnd());
     expect(result.context).toHaveLength(1);
@@ -912,4 +912,21 @@ test('a session that is not interactive reads nothing on the clock', async ($, o
     await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
     await world.clock.advance(10_000);
     expect(rowsReads(world)).toBe(0);
+});
+
+// The queue file set to `LATER.md` in `/config`.
+const SET_FILE = { options: { rewrite: 'off', file: 'LATER.md' } };
+
+// A bare run where the session is not interactive lists, an add parks, and after an interactive start a bare run
+// opens the pane and a `d` closes a note and reads again: each run is given the setting.
+test('every engine run carries the queue file setting', SET_FILE, async ($, on) => {
+    const world = stage(on);
+    await $.session.start(HEADLESS);
+    await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
+    await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
+    const ui = await openPane($, 'terminal');
+    await ui.press({ key: 'done' });
+    expect(engineCalls(world).map(([verb]) => verb)).toEqual(['list', 'add', 'rows', 'done', 'rows']);
+    const files = world.inits.map((init) => init?.env?.['CLAUDE_PLUGIN_OPTION_FILE']);
+    expect(files).toEqual(['LATER.md', 'LATER.md', 'LATER.md', 'LATER.md', 'LATER.md']);
 });
