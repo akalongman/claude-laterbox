@@ -1,17 +1,18 @@
 ---
 name: notes
-description: 'Use when the user asks what is parked, asks to act on, close or drop a parked note in the project''s NOTES.local.md queue, or parks a note in words rather than with /later. Triggers: "what is parked", "do the second parked note", "tick that note off", "drop note 3", "park this for later". Typed /later commands are handled outside this skill.'
+description: 'Use when the user asks what is parked, asks to act on, close or drop a parked note in the project''s parked-notes queue (`LATER.local.md` unless the `laterbox.file` setting names another file), or parks a note in words rather than with /later. Triggers: "what is parked", "do the second parked note", "tick that note off", "drop note 3", "park this for later". Typed /later commands are handled outside this skill.'
 user-invocable: false
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/later.sh list) Bash(${CLAUDE_PLUGIN_ROOT}/scripts/later.sh add:*) Bash(${CLAUDE_PLUGIN_ROOT}/scripts/later.sh done:*) Bash(${CLAUDE_PLUGIN_ROOT}/scripts/later.sh drop:*)
 ---
 
 # Parking lot
 
-`NOTES.local.md` at a project's root is a checkbox queue of follow-ups. It is a
-backlog: a parked note waits for a later session, it is not a task for now. The
-engine is `${CLAUDE_PLUGIN_ROOT}/scripts/later.sh`; wherever `later.sh` appears
-below, run that full path. It finds the right queue from any subdirectory or
-worktree, so never build the queue's path yourself.
+The project's parked-notes queue (`LATER.local.md` unless the `laterbox.file`
+setting names another file) is a checkbox list of follow-ups at the project's
+root. It is a backlog: a parked note waits for a later session, it is not a
+task for now. The engine is `${CLAUDE_PLUGIN_ROOT}/scripts/later.sh`; wherever
+`later.sh` appears below, run that full path. It finds the right queue from any
+subdirectory or worktree, so never build the queue's path yourself.
 
 Do exactly one of the following.
 
@@ -46,7 +47,7 @@ working on it. Confirm in one short line.
 5. For a note the user says is no longer relevant, use `later.sh drop <n>`,
    which deletes the line.
 
-Never edit `NOTES.local.md` by hand: the engine is the only program that writes it.
+The engine is the only program that writes the queue: never edit it by hand.
 
 ## Background
 

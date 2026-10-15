@@ -21,6 +21,12 @@
       "description": "link: at session start, keep a later command in ~/.local/bin that runs this plugin; off: remove the link this plugin made and add none.",
       "options": ["link", "off"],
       "default": "link"
+    },
+    "file": {
+      "type": "string",
+      "title": "Queue file",
+      "description": "File name of the parked-notes queue at each project's root, one name for every project. Renaming it does not move existing queues.",
+      "default": "LATER.local.md"
     }
   }
 }

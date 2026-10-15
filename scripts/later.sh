@@ -2,7 +2,7 @@
 #
 # later.sh: parking lot for follow-up notes, kept as a per-project backlog.
 #
-#   add <note>       append a stamped note to the project's NOTES.local.md
+#   add <note>       append a stamped note to the project's queue file
 #   list             print the open notes, numbered, with their age
 #   rows             a tab-separated listing for programs: "queue\t<label>",
 #                    then "note\t<n>\t<age>\t<text>" per open note
@@ -16,11 +16,20 @@
 #                    plus the oldest notes once per LATER_DIGEST_DAYS, and
 #                    the terminal command kept linked in ~/.local/bin
 #
+# The queue file is LATER.local.md at the project's root, unless the
+# laterbox.file setting names another file (see resolve_queue_name).
+#
 # The hook owns WHEN (hooks/hooks.json fires this on session start); this
 # script owns WHAT. No `set -e`: the hook path must exit 0 whatever happens,
 # so a broken reminder can never delay or block a session.
 
-NOTES_FILE_NAME='NOTES.local.md'
+DEFAULT_QUEUE_NAME='LATER.local.md'
+# The queue file's name for this run, set by resolve_queue_name.
+QUEUE_NAME=$DEFAULT_QUEUE_NAME
+# Set, possibly to empty, to the unusable laterbox.file value this run saw.
+unset QUEUE_NAME_REJECTED
+# The stored copy of the setting, for runs Claude Code did not start.
+SETTING_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/later/queue-file"
 # shellcheck disable=SC2016  # the backticks are literal markdown
 NOTE_HEADING='# Parked notes (`/later`)'
 
@@ -36,6 +45,8 @@ NOTICE_ADDED='later: added the terminal command ~/.local/bin/later; set laterbox
 NOTICE_REMOVED='later: removed the terminal command ~/.local/bin/later.'
 NOTICE_REFUSED='later: ~/.local/bin/later exists and was not made by this plugin, so the terminal command was not added; remove it and start a new session to get it.'
 NOTICE_PATH="later: ~/.local/bin is not on PATH in this session, so a terminal may not find later; add it to PATH in your shell's startup file."
+# A printf format: the unusable value, then the name used instead.
+NOTICE_BAD_NAME='later: laterbox.file is "%s", which is not a plain file name, so %s is used; change it in /config.'
 
 OPEN_RE='^[[:space:]]*-[[:space:]]+\[[[:space:]]\][[:space:]]*(.*)$'
 STAMP_RE=' \(([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2})\)$'
@@ -43,6 +54,65 @@ STAMP_LEN=19   # length of " (YYYY-MM-DD HH:MM)"
 
 # LATER_NOW (epoch seconds) replaces the clock, for tests.
 now() { printf '%s' "${LATER_NOW:-$(date +%s)}"; }
+
+# True when <name> is one plain file name: not empty, not . or .., no / or \,
+# no glob character (`all` would read every matching file as a queue), no
+# control character, at most 255 bytes.
+usable_queue_name() {
+    local name="$1" bytes
+    case "$name" in
+        ''|.|..|*/*|*\\*|*\**|*\?*|*\[*|*[[:cntrl:]]*) return 1 ;;
+    esac
+    # ${#name} counts characters, and a character is at most 6 bytes (the
+    # old UTF-8 maximum), so only a name over 42 needs its bytes counted.
+    [ "${#name}" -le 42 ] && return 0
+    bytes=$(printf '%s' "$name" | wc -c)
+    [ "${bytes//[!0-9]/}" -le 255 ]
+}
+
+# Sets QUEUE_NAME from the first of these that gives a usable name:
+#   1. CLAUDE_PLUGIN_OPTION_FILE, the laterbox.file setting. Claude Code
+#      exports an option to a hook only once the user has set it, so
+#      session-start reads its absence as the default;
+#   2. the stored copy, for the terminal command and the skill's calls;
+#   3. the default.
+# A name from 1 replaces the copy when the copy holds anything else. An
+# unusable value is never used or stored; the next source decides.
+resolve_queue_name() { # subcommand
+    local stored='' from_setting=''
+    if [ -n "${CLAUDE_PLUGIN_OPTION_FILE+set}" ]; then
+        if usable_queue_name "$CLAUDE_PLUGIN_OPTION_FILE"; then
+            QUEUE_NAME=$CLAUDE_PLUGIN_OPTION_FILE
+            from_setting=1
+        else
+            QUEUE_NAME_REJECTED=$CLAUDE_PLUGIN_OPTION_FILE
+        fi
+    elif [ "$1" = session-start ]; then
+        QUEUE_NAME=$DEFAULT_QUEUE_NAME
+        from_setting=1
+    fi
+    # The copy less its final newline; empty when missing or unreadable.
+    { IFS= read -r -d '' stored; } 2>/dev/null < "$SETTING_FILE"
+    stored=${stored%$'\n'}
+    if [ -n "$from_setting" ]; then
+        [ "$stored" = "$QUEUE_NAME" ] || store_queue_name
+    elif usable_queue_name "$stored"; then
+        QUEUE_NAME=$stored
+    else
+        QUEUE_NAME=$DEFAULT_QUEUE_NAME
+    fi
+}
+
+# Replaces the stored copy with QUEUE_NAME by a rename from its own folder,
+# so a reader sees the old copy or the new one, never a part.
+store_queue_name() {
+    local dir=${SETTING_FILE%/*} tmp
+    mkdir -p "$dir" || return 0
+    tmp=$(mktemp "$dir/.queue-file.XXXXXX") || return 0
+    if ! { printf '%s\n' "$QUEUE_NAME" > "$tmp" && mv -f "$tmp" "$SETTING_FILE"; }; then
+        rm -f "$tmp"
+    fi
+}
 
 # Root of the main checkout containing <dir>, or nothing outside a work tree.
 # A linked worktree resolves to the main checkout through the common git dir.
@@ -69,7 +139,7 @@ queue_file() {
     if [ -n "$root" ] && [ "$root" = "$home" ] && [ "$dir" != "$home" ]; then
         root=''
     fi
-    printf '%s/%s\n' "${root:-$dir}" "$NOTES_FILE_NAME"
+    printf '%s/%s\n' "${root:-$dir}" "$QUEUE_NAME"
 }
 
 queue_label() { basename "$(dirname "$1")"; }
@@ -259,7 +329,7 @@ find_queues() {
         [ -d "$root" ] || continue
         find "$root" -maxdepth "$SCAN_DEPTH" \
             \( -name node_modules -o -name vendor -o -name .git -o -name .worktrees \) -prune \
-            -o -xtype f -name "$NOTES_FILE_NAME" -print 2>/dev/null
+            -o -xtype f -name "$QUEUE_NAME" -print 2>/dev/null
     done | sort -u
 }
 
@@ -382,7 +452,7 @@ terminal_link() {
 
 cmd_session_start() {
     command -v jq >/dev/null 2>&1 || return 0
-    local input cwd src agent file rows='' count sf='' shown=0 digest=0 t floor msg='' notices
+    local input cwd src agent file rows='' count sf='' shown=0 digest=0 t floor msg='' notices bad
     input=$(cat)
     cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)
     src=$(printf '%s' "$input" | jq -r '.source // empty' 2>/dev/null)
@@ -430,7 +500,14 @@ cmd_session_start() {
     fi
 
     # The notices follow the count line, one per line, in the same message.
+    # An unusable laterbox.file comes last, at every start while it is set;
+    # a control character in it shows as ?, keeping the notice one line.
     notices=$(terminal_link)
+    if [ -n "${QUEUE_NAME_REJECTED+set}" ]; then
+        # shellcheck disable=SC2059  # NOTICE_BAD_NAME is the format
+        printf -v bad "$NOTICE_BAD_NAME" "${QUEUE_NAME_REJECTED//[[:cntrl:]]/?}" "$QUEUE_NAME"
+        notices+="${notices:+$'\n'}$bad"
+    fi
     [ -n "$msg" ] && [ -n "$notices" ] && msg+=$'\n'
     msg+=$notices
     [ -n "$msg" ] || return 0
@@ -444,6 +521,10 @@ cmd_session_start() {
 usage() {
     echo 'usage: later.sh {add <note> | list | rows | done [--if <text>] <n>... | drop [--if <text>] <n>... | all | session-start}'
 }
+
+# Before the dispatch, so session-start stores the setting before any of its
+# early exits. Silent: the session-start path writes nothing to stderr.
+resolve_queue_name "${1:-}" 2>/dev/null
 
 case "${1:-}" in
     add)           shift; cmd_add "$@" ;;
