@@ -377,6 +377,22 @@ assert_eq "$(count_lines < "$rf/$Q")" "2" "CRLF: drop removes the line"
 assert_eq "$(line_bytes "$rf/$Q" 1)" "$l2" "CRLF: drop leaves the closed line byte-identical"
 assert_eq "$(line_bytes "$rf/$Q" 2)" "$l3" "CRLF: drop leaves the last line byte-identical"
 
+# A queue saved without its final line end, the common shape on Windows:
+# the last line stays without one, closed or not, and the line before a
+# dropped last line keeps its own line end. Whole files are compared, since
+# sed adds a newline to an unterminated last line on some platforms.
+crlf_file() { printf '%s\r\n' "${@:1:$#-1}"; printf '%s' "${!#}"; } # lines...: CRLF ends, none after the last
+ne="$(mk_repo)"
+crlf_file '- [ ] one' '- [ ] two' '- [ ] three' > "$ne/$Q"
+lt "$ne" done 1 >/dev/null
+assert_eq "$(od -c < "$ne/$Q")" "$(crlf_file '- [x] one' '- [ ] two' '- [ ] three' | od -c)" "no final line end: done 1 leaves the last line's bytes unchanged"
+assert_eq "$(lt "$ne" done 2)" "later: done -> three" "no final line end: done closes the last note"
+assert_eq "$(od -c < "$ne/$Q")" "$(crlf_file '- [x] one' '- [ ] two' '- [x] three' | od -c)" "no final line end: done on the last note adds no line end"
+nd="$(mk_repo)"
+crlf_file '- [ ] one' '- [ ] two' '- [ ] three' > "$nd/$Q"
+assert_eq "$(lt "$nd" drop 3)" "later: dropped -> three" "no final line end: drop removes the last note"
+assert_eq "$(od -c < "$nd/$Q")" "$(printf '%s\r\n' '- [ ] one' '- [ ] two' | od -c)" "no final line end: drop of the last note leaves the line before it byte-identical, line end included"
+
 # The mark is read on the first line only; done keeps it, and drop removes
 # it with its line.
 bm="$(mk_repo)"

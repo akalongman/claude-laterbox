@@ -458,11 +458,15 @@ cmd_rows() {
 # that changed or vanished since a program listed it is refused before any
 # temporary file exists. The rewrite changes only the lines it closes: done
 # turns the first [ ] into [x] and keeps the rest, a carriage return or a
-# byte-order mark included; drop removes the whole line. awk prints every
-# other line as it read it.
+# byte-order mark included; drop removes the whole line. Every other line is
+# copied with the bytes it was read with. A queue saved without a final line
+# end keeps none: awk holds each line back until it has read the next, and
+# writes the file's last line without a newline when the file had none and
+# that line is kept. A line that a dropped last line followed keeps its own
+# line end. The last byte costs one process, whatever the queue's size.
 close_notes() {
     local mode="$1" file="$2"; shift 2
-    local guarded='' expect='' rows count n lines tmp verb target dir text
+    local guarded='' expect='' rows count n lines tmp verb target dir text ended
     if [ "${1:-}" = '--if' ]; then
         guarded=1; expect="${2-}"; shift 2
     fi
@@ -495,10 +499,14 @@ close_notes() {
         printf '%s\n' "$rows" | awk -F'\t' -v i="$n" '$1 == i + 0 { print $2 }'
     done | sort -un | tr '\n' ' ')
     tmp=$(mktemp "$dir/.later-queue.XXXXXX") || { echo 'later: cannot write beside the queue' >&2; return 1; }
-    if awk -v lines="$lines" -v mode="$mode" '
+    # 1 when the file ends in a newline; the substitution drops that newline.
+    ended=1
+    [ -n "$(tail -c1 "$target")" ] && ended=0
+    if awk -v lines="$lines" -v mode="$mode" -v ended="$ended" '
             BEGIN { split(lines, a, " "); for (k in a) pick[a[k]] = 1 }
             (NR in pick) { if (mode == "drop") next; sub(/\[[[:space:]]\]/, "[x]") }
-            { print }
+            { if (held) print kept; kept = $0; kept_nr = NR; held = 1 }
+            END { if (held) printf "%s%s", kept, ((ended == 1 || kept_nr < NR) ? "\n" : "") }
         ' "$target" > "$tmp" && chmod --reference="$target" "$tmp" && mv "$tmp" "$target"; then
         verb='done'; [ "$mode" = drop ] && verb='dropped'
         for n in "$@"; do
