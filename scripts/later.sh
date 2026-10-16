@@ -875,10 +875,11 @@ terminal_link() {
     [ -n "${CLAUDE_PLUGIN_DATA:-}" ] || return 0
     case "$(uname -s)" in Linux|Darwin) ;; *) return 0 ;; esac
     local root data user tmp link path_state state seen_link='' seen_path=''
-    # The script's own resolved location, never CLAUDE_PLUGIN_ROOT, which a
-    # hook of another plugin can inherit. Its folder is physical, so the
-    # folder above it is the plugin root. This step runs in a command
-    # substitution, so the folders real_path enters are left with it.
+    # The script's own resolved location, never the plugin root variable of
+    # the environment, which a hook of another plugin can inherit. Its folder
+    # is physical, so the folder above it is the plugin root. This step runs
+    # in a command substitution, so the folders real_path enters are left
+    # with it.
     real_path "${BASH_SOURCE[0]}" || return 0
     root=${REPLY%/*}; root=${root%/*}
     # Spec R5.7: no link to a front-end that is missing or cannot run.
