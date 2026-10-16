@@ -1,3 +1,5 @@
-* text=auto eol=lf
-*.sh text eol=lf
-scripts/later text eol=lf
+# Git never converts line endings here: every file is committed with LF and
+# checks out with the same bytes, also where core.autocrlf is true (the Git
+# for Windows default). An attribute that rewrites file contents (text, eol,
+# filter) would stop the plugin directory's validation.
+* -text
