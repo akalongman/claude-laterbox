@@ -216,8 +216,8 @@ the engine and the terminal command make no network access.
   `terminal-state`, the last link and `PATH` conditions the hook saw. The
   plugin writes there on Linux and macOS only.
 - **The link `~/.local/bin/later`**, to `bin/later` in the data folder, made
-  at a terminal session start on Linux and macOS. It lives outside the plugin
-  folder. The hook never replaces a file it did not make, and setting
+  at a terminal session start on Linux and macOS, creating `~/.local/bin`
+  when it is missing. It lives outside the plugin folder. The hook never replaces a file it did not make, and setting
   `laterbox.terminal` to `off` removes the link at the next session start.
 - **The state folder `~/.cache/later/`** (`$XDG_CACHE_HOME/later/` when that
   is set). Per queue, under a SHA-1 of the queue's path: when the
@@ -291,6 +291,10 @@ its first session start shows its notes as new, once.
 claude plugin uninstall laterbox@akalongman
 ```
 
+A team install comes out the way it went in: run
+`claude plugin uninstall laterbox@akalongman --scope project` inside the
+repository and commit the `.claude/settings.json` it changes.
+
 Uninstalling deletes the plugin's data folder. What stays behind:
 
 - `~/.local/bin/later`, now a dangling link that shells skip ("command not
@@ -319,6 +323,8 @@ bash tests/later.test.sh
 shellcheck scripts/later scripts/later.sh tests/*.sh
 ```
 
+The suite's helpers build and read the hook's JSON with `jq`, so the suite
+needs `jq` on `PATH` (the engine itself does not, and the suite proves it).
 The suite says which helper program it lacks before it stops, and prints a
 reason for every case it skips on the platform it runs on. To run it with the
 engine limited to the system folders, as CI does on macOS:
