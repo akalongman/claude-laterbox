@@ -1092,7 +1092,7 @@ assert_nofile "$fs/$Q" "the stored copy: no queue under the default name"
 # but 258 bytes.
 long256="$(printf 'x%.0s' $(seq 1 253)).md"
 geo258="$(printf 'ა%.0s' $(seq 1 86))"
-for bad in '' . .. a/b 'a\b' '*.md' 'x?' '[x]' "a${T}b.md" "$long256" "$geo258"; do
+for bad in . .. a/b 'a\b' '*.md' 'x?' '[x]' "a${T}b.md" "$long256" "$geo258"; do
     label="'${bad:0:12}'"; label="${label//$T/<tab>}"
     fresh_state; ub="$(mk_repo)"
     assert_eq "$(CLAUDE_PLUGIN_OPTION_FILE="$bad" lt "$ub" add with no copy 2>&1)" "later: parked -> with no copy" "unusable $label, no copy: add parks and prints nothing else"
@@ -1104,6 +1104,23 @@ for bad in '' . .. a/b 'a\b' '*.md' 'x?' '[x]' "a${T}b.md" "$long256" "$geo258";
     assert_contains "$(cat "$ub/LATER.md" 2>/dev/null)" "with a copy" "unusable $label, a copy: the stored name is used"
     assert_eq "$(file_digest "$T_STATE/later/queue-file")" "$before" "unusable $label: the copy is unchanged"
 done
+
+# A cleared setting: Claude Code stores a cleared option as "" and passes the
+# empty string to the hook and the module, so an empty value means not set:
+# the default is used and stored, with no notice, whatever the copy holds.
+ce="$(mk_repo)"
+fresh_state; store_copy LATER.md
+assert_eq "$(CLAUDE_PLUGIN_OPTION_FILE='' lt "$ce" add after clearing 2>&1)" "later: parked -> after clearing" "a cleared setting: add parks and prints nothing else"
+assert_contains "$(cat "$ce/$Q" 2>/dev/null)" "after clearing" "a cleared setting: add uses the default, not the copy"
+assert_nofile "$ce/LATER.md" "a cleared setting: no queue under the stored name"
+assert_eq "$(stored_copy)" "$Q" "a cleared setting: the default replaces the copy"
+lt "$ce" add from the terminal >/dev/null
+assert_contains "$(cat "$ce/$Q")" "from the terminal" "after a cleared setting, a run without the setting follows the default"
+fresh_state; store_copy LATER.md
+out="$(hook_in "$ce" | CLAUDE_PLUGIN_OPTION_FILE='' ss)"
+assert_contains "$(printf '%s\n' "$out" | sed -n 1p)" "later: 2 parked in $(basename "$ce")" "a cleared setting: session-start counts the default queue"
+assert_eq "$(printf '%s\n' "$out" | grep -c 'not a plain file name')" "0" "a cleared setting is not announced"
+assert_eq "$(stored_copy)" "$Q" "a cleared setting: session-start stores the default"
 
 # 255 bytes is usable, ASCII or not: 85 Georgian letters are 255 bytes.
 for good in "$(printf 'x%.0s' $(seq 1 252)).md" "$(printf 'ა%.0s' $(seq 1 85))"; do
@@ -1149,8 +1166,6 @@ assert_eq "$(printf '%s\n' "$out" | tail -n1)" "$BAD" "an unusable setting: the 
 fresh_state; store_copy LATER.md
 assert_eq "$(hook_in "$bn" | CLAUDE_PLUGIN_OPTION_FILE=a/b ss)" 'later: laterbox.file is "a/b", which is not a plain file name, so LATER.md is used; change it in /config.' "the notice names the stored name it fell back to"
 assert_eq "$(stored_copy)" "LATER.md" "an unusable setting leaves the copy as it was"
-fresh_state
-assert_eq "$(hook_in "$bn" | CLAUDE_PLUGIN_OPTION_FILE='' ss | tail -n1)" 'later: laterbox.file is "", which is not a plain file name, so LATER.local.md is used; change it in /config.' "an empty setting is announced"
 fresh_state
 assert_eq "$(hook_in "$bn" | CLAUDE_PLUGIN_OPTION_FILE=$'a\nb' ss | tail -n1)" 'later: laterbox.file is "a?b", which is not a plain file name, so LATER.local.md is used; change it in /config.' "a control character in the setting shows as ? and keeps the notice one line"
 

@@ -89,14 +89,19 @@ usable_queue_name() {
 # Sets QUEUE_NAME from the first of these that gives a usable name:
 #   1. CLAUDE_PLUGIN_OPTION_FILE, the laterbox.file setting. Claude Code
 #      exports an option to a hook only once the user has set it, so
-#      session-start reads its absence as the default;
+#      session-start reads its absence as the default; a cleared option is
+#      stored and passed as the empty string, so an empty value is the
+#      default too, for the hook and the module alike;
 #   2. the stored copy, for the terminal command and the skill's calls;
 #   3. the default.
 # A name from 1 replaces the copy when the copy holds anything else. An
 # unusable value is never used or stored; the next source decides.
 resolve_queue_name() { # subcommand
     local stored='' from_setting=''
-    if [ -n "${CLAUDE_PLUGIN_OPTION_FILE+set}" ]; then
+    if [ "${CLAUDE_PLUGIN_OPTION_FILE+set}" = set ] && [ -z "$CLAUDE_PLUGIN_OPTION_FILE" ]; then
+        QUEUE_NAME=$DEFAULT_QUEUE_NAME
+        from_setting=1
+    elif [ -n "${CLAUDE_PLUGIN_OPTION_FILE+set}" ]; then
         if usable_queue_name "$CLAUDE_PLUGIN_OPTION_FILE"; then
             QUEUE_NAME=$CLAUDE_PLUGIN_OPTION_FILE
             from_setting=1
@@ -425,8 +430,11 @@ with_lock() {
 # command's status; a killed holder leaves it behind under a dead id. A
 # waiter tries every 0.1 seconds for at most 5 seconds, then refuses. It
 # breaks the folder at once when the id names no live process, and when the
-# folder is over 60 seconds old, which no writer holds it for (the id was
-# reused by another process, or never written). A missing or empty id proves
+# folder is old enough that no writer holds it so long (the id was reused by
+# another process, or never written): find -mmin +1 means more than one
+# minute where find rounds the age up (BSD, macOS) and two minutes or more
+# where it truncates the age (GNU, Linux and Git Bash). -mmin +0 would break
+# a 30-second-old folder on BSD. A missing or empty id proves
 # nothing: the holder writes it just after its mkdir. The age costs a
 # process, so it is read once per second of the wait.
 #
@@ -478,7 +486,7 @@ with_lock_dir() { # lock command...
     status=$?
     # Removed while it holds this writer's id, or none (the write failed, a
     # full disk). A folder naming another id was broken while the command
-    # ran (held past 60 seconds, a suspended machine) and is another
+    # ran (held past the age limit above, a suspended machine) and is another
     # writer's now; a new holder that has not written its id yet still looks
     # like none.
     pid=''

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # later: park and manage follow-up notes from any terminal. Thin front-end
-# over the engine of the `later` plugin.
+# over the engine of the laterbox plugin.
 #
 # The whole argument string is the note unless it has the exact shape of a
 # subcommand: `all` alone, or `done` / `drop` followed only by note numbers.

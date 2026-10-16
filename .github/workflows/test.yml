@@ -26,6 +26,8 @@ jobs:
           node-version: 24
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code@2.1.296
+      - name: Log the Claude Code version
+        run: claude --version
       - name: Install strace
         run: |
           sudo apt-get update
@@ -82,7 +84,8 @@ jobs:
       - name: Run the engine tests
         run: PATH="$(cygpath -u "$RUNNER_TEMP")/jq-lf:$PATH" bash tests/later.test.sh
       - name: Time rows on a queue of 2000 notes
-        # No time bound: the time is read from this log.
+        # No time bound: the time is read from this log, also after a red suite.
+        if: ${{ !cancelled() }}
         run: |
           engine="$PWD/scripts/later.sh"
           t="$(cygpath -u "$RUNNER_TEMP")/rows"
