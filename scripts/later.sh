@@ -555,6 +555,9 @@ cmd_rows() {
 # cp -p gives the temporary file the queue's mode before the new content
 # goes into it (chmod --reference, which did that after, is GNU only), so a
 # queue its owner cannot write is refused here, as append_note refuses it.
+# BINMODE=3 makes gawk on Git for Windows read and write bytes as they are;
+# it reads in text mode otherwise and drops every carriage return. Other
+# awks take it for an ordinary variable and ignore it.
 close_notes() {
     local mode="$1" file="$2"; shift 2
     local guarded='' expect='' rows count n lines tmp verb target dir text ended
@@ -597,7 +600,7 @@ close_notes() {
     # 1 when the file ends in a newline; the substitution drops that newline.
     ended=1
     [ -n "$(tail -c1 "$target")" ] && ended=0
-    if cp -p "$target" "$tmp" && awk -v lines="$lines" -v mode="$mode" -v ended="$ended" '
+    if cp -p "$target" "$tmp" && awk -v BINMODE=3 -v lines="$lines" -v mode="$mode" -v ended="$ended" '
             BEGIN { split(lines, a, " "); for (k in a) pick[a[k]] = 1 }
             (NR in pick) { if (mode == "drop") next; sub(/\[[[:space:]]\]/, "[x]") }
             { if (held) print kept; kept = $0; kept_nr = NR; held = 1 }

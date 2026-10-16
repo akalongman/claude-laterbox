@@ -227,22 +227,38 @@ nq="$(mk_repo)"
 assert_fail "done with no queue file fails" lt "$nq" done 1
 assert_nofile "$nq/$Q" "done does not create a queue"
 
+# check_race <queue dir> <stderr dir> <label prefix>, after 8 adds raced 8
+# `done 1` on a queue of 8 seeds: every writer landed or said the queue is
+# locked, and printed nothing else, so no update is lost silently. Only on
+# Git Bash may a writer be refused: one write there costs over a second, so
+# 16 writers outrun the 5-second wait (spec R8.2).
+LOCKED='later: the queue is locked by another writer'
+check_race() {
+    local dir="$1" errs="$2" p="$3" refused_add refused_done
+    refused_add=$(cat "$errs"/add.* | grep -c -F "$LOCKED")
+    refused_done=$(cat "$errs"/done.* | grep -c -F "$LOCKED")
+    assert_eq "$(cat "$errs"/add.* "$errs"/done.* | grep -v -c -F "$LOCKED")" "0" "${p}racing writers print nothing but the lock refusal"
+    assert_eq "$(( $(grep -c 'racer' "$dir/$Q") + refused_add ))" "8" "${p}no append lost during rewrites"
+    assert_eq "$(( $(grep -c '^- \[x\]' "$dir/$Q") + refused_done ))" "8" "${p}every done landed or was refused"
+    if [ "$PLATFORM" != gitbash ]; then
+        assert_eq "$((refused_add + refused_done))" "0" "${p}no writer is refused off Git Bash"
+    fi
+}
+
 # Parallel writers: a rewrite racing appends must not lose a note.
-r="$(mk_repo)"
+r="$(mk_repo)"; re="$(mk_tmpdir)"
 for i in 1 2 3 4 5 6 7 8; do lt "$r" add "seed $i" >/dev/null; done
-for i in 1 2 3 4 5 6 7 8; do lt "$r" add "racer $i" >/dev/null & lt "$r" done 1 >/dev/null & done
+for i in 1 2 3 4 5 6 7 8; do lt "$r" add "racer $i" >/dev/null 2>"$re/add.$i" & lt "$r" done 1 >/dev/null 2>"$re/done.$i" & done
 wait
-assert_eq "$(grep -c 'racer' "$r/$Q")" "8" "no append lost during rewrites"
-assert_eq "$(grep -c '^- \[x\]' "$r/$Q")" "8" "every done landed"
+check_race "$r" "$re" ''
 
 # The same race on the lock folder of macOS and Git Bash (spec R5.2):
 # LATER_NO_FLOCK=1 makes the engine take it on Linux too.
-r="$(mk_repo)"
+r="$(mk_repo)"; re="$(mk_tmpdir)"
 for i in 1 2 3 4 5 6 7 8; do lt "$r" add "seed $i" >/dev/null; done
-for i in 1 2 3 4 5 6 7 8; do LATER_NO_FLOCK=1 lt "$r" add "racer $i" >/dev/null & LATER_NO_FLOCK=1 lt "$r" done 1 >/dev/null & done
+for i in 1 2 3 4 5 6 7 8; do LATER_NO_FLOCK=1 lt "$r" add "racer $i" >/dev/null 2>"$re/add.$i" & LATER_NO_FLOCK=1 lt "$r" done 1 >/dev/null 2>"$re/done.$i" & done
 wait
-assert_eq "$(grep -c 'racer' "$r/$Q")" "8" "no flock: no append lost during rewrites"
-assert_eq "$(grep -c '^- \[x\]' "$r/$Q")" "8" "no flock: every done landed"
+check_race "$r" "$re" 'no flock: '
 assert_nofile "$(lock_of "$r")" "no flock: the last writer removes the lock folder"
 
 # The same on Linux with BusyBox's flock first on the PATH, as on Alpine,
@@ -427,7 +443,9 @@ assert_contains "$(XDG_STATE_HOME="$T_STATE" PATH="$ENGINE_PATH" bash "$ENGINE" 
 # closes and copies every other line byte for byte.
 
 BOM=$'\357\273\277'
-line_bytes() { sed -n "$2p" "$1" | od -c; } # file n: line n's bytes, its line end included
+# file n: line n's bytes, its line end included. awk with BINMODE=3, since
+# Git for Windows' text-mode tools would drop the carriage return.
+line_bytes() { awk -v BINMODE=3 -v n="$2" 'NR == n { print; exit }' "$1" | od -c; }
 
 cr="$(mk_repo)"
 printf '%s\r\n' '# Parked notes (`/later`)' '' '- [ ] Recheck group lecturer policy (2026-09-22 09:00)' > "$cr/$Q"
