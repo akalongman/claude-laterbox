@@ -87,7 +87,7 @@ jobs:
         # No time bound: the time is read from this log, also after a red suite.
         if: ${{ !cancelled() }}
         run: |
-          engine="$PWD/scripts/later.sh"
+          engine="$(cygpath -u '${{ github.workspace }}')/scripts/later.sh"
           t="$(cygpath -u "$RUNNER_TEMP")/rows"
           mkdir -p "$t/repo" "$t/home" "$t/cache" "$t/state"
           git -C "$t/repo" init -q

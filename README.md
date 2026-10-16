@@ -174,6 +174,27 @@ runs, the desktop app, IDE extensions and SDK hosts skip it.
   these four.
 - The terminal command, `scripts/later`, which runs `scripts/later.sh`.
 
+What the hooks module does, call by call:
+
+- **Hooks.** `session.start` registers `/later` and, while the pane is open,
+  re-reads the queue every five seconds. `command.run` answers `/later`
+  only: it parks a note or opens the pane. `ui.render`, `ui.focus` and
+  `ui.close` draw and drive its own pane only.
+- **The one program it starts** (`process.run`): the plugin's own engine,
+  `scripts/later.sh` in the plugin's install folder, whose path is built
+  from that folder when it runs. The arguments are one subcommand (`add`,
+  `list`, `rows`, `done` or `drop`) and, for `add`, `done` and `drop`, the
+  note text or number. The environment variable `CLAUDE_PLUGIN_OPTION_FILE`
+  carries the queue file setting. Nothing else is run.
+- **What it reads.** The conversation's newest messages
+  (`session.messages`), only to build the rewrite's excerpt for the model
+  call below; and its own pane state (the queue as listed, the selected
+  note), only to draw the pane. Neither reaches the engine, which gets the
+  note text alone, and neither leaves the machine except through the
+  rewrite's model call described under [What it sends](#what-it-sends).
+- **The prompt draft.** `w` (or Enter on a row) puts the note's text at the
+  end of the prompt draft; nothing is sent.
+
 The engine runs git only to find the project root (`git rev-parse`), and
 otherwise standard tools such as `date`, `awk`, `sed`, `sort` and `find`.
 `later all` reads every file named like the queue under your home folder, up

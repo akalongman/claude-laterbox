@@ -699,7 +699,7 @@ assert_eq "$(hook_in "$e" | ss)" "" "no queue file: nothing"
 assert_eq "$(hook_in "$d" | ss)" "" "no open notes: nothing"
 assert_eq "$(hook_in /nonexistent/dir | ss)" "" "missing directory: nothing"
 assert_eq "$(hook_in "$s" | ( cd / && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" CLAUDE_CODE_ENTRYPOINT=sdk-cli PATH="$ENGINE_PATH" bash "$ENGINE" session-start ))" "" "headless session is ignored"
-assert_ok "malformed input exits 0" bash -c "printf 'not json' | HOME='$T_HOME' XDG_CACHE_HOME='$T_CACHE' XDG_STATE_HOME='$T_STATE' CLAUDE_CODE_ENTRYPOINT=cli PATH='$ENGINE_PATH' bash '$ENGINE' session-start"
+assert_ok "malformed input exits 0" env HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" CLAUDE_CODE_ENTRYPOINT=cli PATH="$ENGINE_PATH" bash "$ENGINE" session-start <<< 'not json'
 
 # An unreadable queue: nothing on stdout or stderr, and exit 0.
 if [ "$PLATFORM" = gitbash ]; then

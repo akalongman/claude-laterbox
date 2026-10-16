@@ -530,7 +530,7 @@ async function appendToDraft($: EngineInterface, text: string): Promise<Filled> 
 
 // `w`, or Enter on a row: the note goes into the prompt box and the pane closes. A box that does not take it keeps
 // the pane open, and the status line says why.
-async function work($: EngineInterface, session: PaneSession, row: NoteRow): Promise<void> {
+async function workOnNote($: EngineInterface, session: PaneSession, row: NoteRow): Promise<void> {
     const filled = await appendToDraft($, row.text);
     if (filled.ok) {
         await closePane($, session);
@@ -559,7 +559,7 @@ async function actAlone(session: PaneSession, action: () => Promise<void>): Prom
 async function workOnSelected($: EngineInterface, session: PaneSession): Promise<void> {
     const row = await selectedRow($);
     if (row !== undefined) {
-        await work($, session, row);
+        await workOnNote($, session, row);
     }
 }
 
@@ -691,7 +691,7 @@ async function drawPane(
                         onPress={() =>
                             actAlone(session, async () => {
                                 await update($, selectedState, () => selectionOf(row));
-                                await work($, session, row);
+                                await workOnNote($, session, row);
                             })
                         }
                     >

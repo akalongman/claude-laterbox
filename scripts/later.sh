@@ -19,7 +19,7 @@
 # The queue file is LATER.local.md at the project's root, unless the
 # laterbox.file setting names another file (see resolve_queue_name).
 #
-# The hook owns WHEN (hooks/hooks.json fires this on session start); this
+# The hook owns WHEN (the plugin's SessionStart hook fires this); this
 # script owns WHAT. No `set -e`: the hook path must exit 0 whatever happens,
 # so a broken reminder can never delay or block a session.
 
