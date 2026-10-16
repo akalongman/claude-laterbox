@@ -189,6 +189,22 @@ else
     assert_eq "$(file_mode "$d/$Q")" "rw-r-----" "rewrite keeps the file mode"
 fi
 
+# A queue file its owner cannot write: add, done and drop refuse with one
+# plain line, before any temporary file, and change nothing.
+NOWRITE='later: the queue file is not writable, nothing changed'
+if [ "$PLATFORM" = gitbash ] || [ "$(id -u)" = 0 ]; then
+    skip "a queue file its owner cannot write: Git Bash's chmod and root ignore a missing write permission"
+else
+    ro="$(mk_repo)"
+    lt "$ro" add first >/dev/null; chmod 444 "$ro/$Q"; ro_before="$(file_digest "$ro/$Q")"
+    assert_eq "$(lt "$ro" done 1 2>&1; echo "exit $?")" "$NOWRITE"$'\n'"exit 1" "a read-only queue: done refuses with one plain line"
+    assert_eq "$(lt "$ro" drop 1 2>&1; echo "exit $?")" "$NOWRITE"$'\n'"exit 1" "a read-only queue: drop refuses with one plain line"
+    assert_eq "$(lt "$ro" add second 2>&1; echo "exit $?")" "$NOWRITE"$'\n'"exit 1" "a read-only queue: add refuses with one plain line"
+    assert_eq "$(file_digest "$ro/$Q")" "$ro_before" "a read-only queue is left byte-identical"
+    assert_eq "$(find "$ro" -mindepth 1 -maxdepth 1 ! -name .git ! -name README.md ! -name "$Q" | count_lines)" "0" "a read-only queue: no temporary file is left"
+    chmod 644 "$ro/$Q"
+fi
+
 # Characters that shells, printf and awk like to interpret.
 sp="$(mk_repo)"
 weird='50% of C:\new\table & *.php "quoted" $HOME `tick`'
@@ -496,6 +512,21 @@ bd="$(mk_repo)"
 printf '%s- [ ] first\r\n- [ ] second\r\n' "$BOM" > "$bd/$Q"
 assert_eq "$(lt "$bd" drop --if first 1 2>&1)" "later: dropped -> first" "BOM and CRLF: drop --if matches the first line's note"
 assert_eq "$(od -c < "$bd/$Q")" "$(printf -- '- [ ] second\r\n' | od -c)" "BOM and CRLF: drop removes the first line, mark included, and keeps the next"
+# add on a CRLF queue and on a BOM queue: the new line ends in LF and every
+# line before it stays byte-identical.
+ac="$(mk_repo)"
+printf '%s\r\n' '# Parked notes (`/later`)' '' '- [ ] crlf one' > "$ac/$Q"
+before="$(od -c < "$ac/$Q")"
+assert_eq "$(lt "$ac" add appended to crlf)" "later: parked -> appended to crlf" "CRLF: add parks"
+assert_eq "$(head -n 3 "$ac/$Q" | od -c)" "$before" "CRLF: add leaves the earlier lines byte-identical"
+assert_eq "$(tail -n 1 "$ac/$Q" | od -c)" "$(printf -- '- [ ] appended to crlf (2026-10-04 14:05)\n' | od -c)" "CRLF: the added line ends in LF"
+ab="$(mk_repo)"
+printf '%s- [ ] marked first\n' "$BOM" > "$ab/$Q"
+before="$(od -c < "$ab/$Q")"
+lt "$ab" add appended after a mark >/dev/null
+assert_eq "$(head -n 1 "$ab/$Q" | od -c)" "$before" "BOM: add leaves the marked first line byte-identical"
+assert_eq "$(lt "$ab" list)" "$(basename "$ab"): 2 parked"$'\n'" 1. marked first (undated)"$'\n'" 2. appended after a mark (today)" "BOM: add appends after the marked line"
+
 be="$(mk_repo)"
 printf -- '- [ ] before\n%s- [ ] after a mark\n' "$BOM" > "$be/$Q"
 assert_eq "$(lt "$be" list)" "$(basename "$be"): 1 parked"$'\n'" 1. before (undated)" "BOM: a mark after the first line is text"

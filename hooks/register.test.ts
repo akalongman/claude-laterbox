@@ -930,3 +930,33 @@ test('every engine run carries the queue file setting', SET_FILE, async ($, on) 
     const files = world.inits.map((init) => init?.env?.['CLAUDE_PLUGIN_OPTION_FILE']);
     expect(files).toEqual(['LATER.md', 'LATER.md', 'LATER.md', 'LATER.md', 'LATER.md']);
 });
+
+// The queue file setting of every engine run the world recorded.
+function settingOfRuns(world: Stage): (string | undefined)[] {
+    return world.inits.map((init) => init?.env?.['CLAUDE_PLUGIN_OPTION_FILE']);
+}
+
+test("the pane's a parks with the queue file setting", SET_FILE, async ($, on) => {
+    const world = stage(on);
+    const ui = await openPane($, 'terminal');
+    await ui.press({ key: 'add' });
+    await ui.input({ key: 'new-note', text: TYPED });
+    expect(engineCalls(world)).toContainEqual(['add', TYPED]);
+    expect(settingOfRuns(world)).toEqual(engineCalls(world).map(() => 'LATER.md'));
+});
+
+test('a pane that is not placed lists with the queue file setting', SET_FILE, async ($, on) => {
+    const world = stage(on, { open: 'unplaced' });
+    await $.session.start(SESSION);
+    await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
+    expect(engineCalls(world)).toEqual([['rows'], ['list']]);
+    expect(settingOfRuns(world)).toEqual(['LATER.md', 'LATER.md']);
+});
+
+test('a refused open lists with the queue file setting', SET_FILE, async ($, on) => {
+    const world = stage(on, { open: 'deny' });
+    await $.session.start(SESSION);
+    await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
+    expect(engineCalls(world)).toEqual([['rows'], ['list']]);
+    expect(settingOfRuns(world)).toEqual(['LATER.md', 'LATER.md']);
+});

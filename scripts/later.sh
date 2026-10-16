@@ -45,6 +45,9 @@ SCAN_DEPTH=6
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/later/v2"
 # with_lock's refusal, on both of its paths.
 LOCKED_MSG='later: the queue is locked by another writer'
+# add, done and drop on a queue file its owner cannot write, said before any
+# write is tried, in place of the shell's raw "Permission denied".
+NOWRITE_MSG='later: the queue file is not writable, nothing changed'
 
 # The terminal link step's notices (session-start only).
 NOTICE_ADDED='later: added the terminal command ~/.local/bin/later; set laterbox.terminal to off in /config to remove it.'
@@ -497,6 +500,7 @@ with_lock_dir() { # lock command...
 
 append_note() {
     local file="$1" line="$2"
+    if [ -e "$file" ] && [ ! -w "$file" ]; then echo "$NOWRITE_MSG" >&2; return 1; fi
     [ -f "$file" ] || printf '%s\n\n' "$NOTE_HEADING" > "$file"
     # A hand-edited file may lack its final newline; do not glue two notes.
     [ -n "$(tail -c1 "$file")" ] && printf '\n' >> "$file"
@@ -553,8 +557,9 @@ cmd_rows() {
 # that line is kept. A line that a dropped last line followed keeps its own
 # line end. The last byte costs one process, whatever the queue's size.
 # cp -p gives the temporary file the queue's mode before the new content
-# goes into it (chmod --reference, which did that after, is GNU only), so a
-# queue its owner cannot write is refused here, as append_note refuses it.
+# goes into it (chmod --reference, which did that after, is GNU only). A
+# queue its owner cannot write is refused before that with NOWRITE_MSG, as
+# append_note refuses it.
 # BINMODE=3 makes gawk on Git for Windows read and write bytes as they are;
 # it reads in text mode otherwise and drops every carriage return. Other
 # awks take it for an ordinary variable and ignore it.
@@ -596,6 +601,7 @@ close_notes() {
     lines=$(for n in "$@"; do
         printf '%s\n' "$rows" | awk -F'\t' -v i="$n" '$1 == i + 0 { print $2 }'
     done | sort -un | tr '\n' ' ')
+    [ -w "$target" ] || { echo "$NOWRITE_MSG" >&2; return 1; }
     tmp=$(mktemp "$dir/.later-queue.XXXXXX") || { echo 'later: cannot write beside the queue' >&2; return 1; }
     # 1 when the file ends in a newline; the substitution drops that newline.
     ended=1
