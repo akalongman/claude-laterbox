@@ -146,11 +146,24 @@ test('nothing set gives not found without a check', async () => {
     expect(files.asked).toEqual([]);
 });
 
+test('a bare bash name in SHELL or the override is never asked about or used', async () => {
+    const asked: string[] = [];
+    const everything = async (path: string): Promise<boolean> => {
+        asked.push(path);
+        return true;
+    };
+    expect(await findBash({ SHELL: 'bash', CLAUDE_CODE_GIT_BASH_PATH: 'sh.exe' }, everything)).toEqual(NOT_FOUND);
+    expect(asked).toEqual([]);
+});
+
 test('a usable bash is named bash or sh and lies outside the Windows system folders', async () => {
     expect(isUsableBash(GIT_BASH)).toBe(true);
     expect(isUsableBash('D:/Git/usr/bin/SH.EXE')).toBe(true);
     expect(isUsableBash('/usr/bin/bash')).toBe(true);
+    expect(isUsableBash('/bash')).toBe(true);
     expect(isUsableBash('')).toBe(false);
+    expect(isUsableBash('bash')).toBe(false);
+    expect(isUsableBash('SH.EXE')).toBe(false);
     expect(isUsableBash('C:\\tools\\git-bash.exe')).toBe(false);
     expect(isUsableBash('C:\\Program Files\\Git\\bin\\')).toBe(false);
     expect(isUsableBash('C:\\Windows\\SysWOW64\\bash.exe')).toBe(false);

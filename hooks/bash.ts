@@ -48,14 +48,19 @@ export function isWindowsHost(variables: BashVariables): boolean {
     return variables.OS === 'Windows_NT';
 }
 
-// Whether a path may name Git's bash: non-empty, its file name bash.exe, sh.exe, bash or sh, and no folder on the way
-// a Windows folder that holds WSL's bash; both slashes separate, case is ignored (1.3).
+// Whether a path may name Git's bash: non-empty, not a bare name (a file name with no folder part is never used), its
+// file name bash.exe, sh.exe, bash or sh, and no folder on the way a Windows folder that holds WSL's bash; both
+// slashes separate, case is ignored (1.3).
 export function isUsableBash(path: string): boolean {
     if (path === '') {
         return false;
     }
     const segments = path.toLowerCase().split(SEPARATOR);
-    return BASH_NAMES.has(segments.at(-1) ?? '') && !segments.some((segment) => WINDOWS_FOLDERS.has(segment));
+    return (
+        segments.length > 1 &&
+        BASH_NAMES.has(segments.at(-1) ?? '') &&
+        !segments.some((segment) => WINDOWS_FOLDERS.has(segment))
+    );
 }
 
 // The first candidate of 1.3's five steps, in order, that passes `isUsableBash` and `exists`. An `exists` that rejects
