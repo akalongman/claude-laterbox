@@ -1116,6 +1116,60 @@ for (const [refused, files] of UNSEEN) {
     });
 }
 
+// A file system that stops answering, such as a network mount on Linux or macOS, which the file layer does touch. The
+// tick's look gives up after 2 seconds and the pane reads through the engine and shows its answer. While that look
+// has not settled, a `d` reads without looking and no tick starts another look; once it settles the ticks look again.
+test('a queue file that does not answer is looked at once, then read through the engine', async ($, on) => {
+    const answer = held<boolean>();
+    let isHung = false;
+    const world = stage(on, {
+        rows: () => rowsOf('shop', isHung ? [...ROWS_NOTES, ['today', RERUN]] : ROWS_NOTES, QUEUE_PATH),
+        exists: async (path) => (isHung ? answer.promise : path === QUEUE_PATH),
+        stat: () => STEADY,
+    });
+    const ui = await openPane($, 'terminal');
+    await world.clock.set(5_000);
+    expect(rowsReads(world)).toBe(2);
+    const looks = world.fileChecks.length;
+    isHung = true;
+    await world.clock.set(11_999);
+    expect(world.fileChecks).toHaveLength(looks + 1);
+    expect(rowsReads(world)).toBe(2);
+    await world.clock.set(12_000);
+    expect(rowsReads(world)).toBe(3);
+    expect(await shows(ui, 'shop: 4 parked')).toBe(true);
+    const pressed = ui.press({ key: 'done' });
+    await world.clock.settle();
+    expect(world.fileChecks).toHaveLength(looks + 1);
+    expect(rowsReads(world)).toBe(4);
+    await pressed;
+    await world.clock.set(20_000);
+    expect(world.fileChecks).toHaveLength(looks + 1);
+    expect(rowsReads(world)).toBe(4);
+    answer.release(true);
+    await world.clock.set(25_000);
+    expect(world.fileChecks).toHaveLength(looks + 2);
+    expect(rowsReads(world)).toBe(5);
+});
+
+// The read after a `d` waits for the look no longer than a tick does, so the press settles; the tick after it starts no
+// second look while the first has not settled.
+test('d while the queue file does not answer closes and reads after the timeout', async ($, on) => {
+    const answer = held<boolean>();
+    const world = stage(on, { exists: () => answer.promise, stat: () => STEADY });
+    const ui = await openPane($, 'terminal');
+    const pressed = ui.press({ key: 'done' });
+    await world.clock.settle();
+    expect(engineCalls(world)).toEqual([['rows'], ['done', '--if', '1']]);
+    await world.clock.set(2_000);
+    expect(engineCalls(world)).toEqual([['rows'], ['done', '--if', '1'], ['rows']]);
+    await pressed;
+    expect(await shows(ui, `later: done -> ${CHECK}`)).toBe(true);
+    await world.clock.set(5_000);
+    expect(world.fileChecks).toEqual([QUEUE_PATH]);
+    answer.release(true);
+});
+
 // The open has no file to look at yet; the first tick and the read after a `d` take the folder and look at the file
 // before they run `rows`, and the `d` compares the folder before it runs `done`.
 test('the look comes before the read', async ($, on) => {

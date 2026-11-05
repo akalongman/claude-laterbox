@@ -49,8 +49,8 @@ type Parked =
 // What the module knows of this session, in one object `register` creates: the queue file setting and the launcher
 // every engine run is given (an EngineContext), whether the session is interactive (only then does a bare run open
 // the pane), whether the pane is open, whether an action on a note is running, how many reads of the queue are in
-// flight and how many have started, the refresh timer (C1), and the memo of the read the pane shows (spec R2),
-// undefined until the pane has read.
+// flight and how many have started, the refresh timer (C1), the memo of the read the pane shows (spec R2), undefined
+// until the pane has read, and whether a look at the queue file is still waiting on the file layer.
 type PaneSession = {
     readonly queueFile: string;
     launcher: Promise<Launcher>;
@@ -61,6 +61,7 @@ type PaneSession = {
     readsStarted: number;
     refreshTimer: Timer;
     gate: GateMemo | undefined;
+    isLooking: boolean;
 };
 
 // What the pane saw just before a read of the queue (spec 2.2): the session's working directory, the path the memo
@@ -83,6 +84,12 @@ const REFRESH_MS = 5_000;
 
 // The status line of an action on a note refused because the session left the folder the list was read in (spec 2.4).
 const MOVED_LINE = 'later: the session moved to another folder; the list was read again';
+
+// How long a read waits for its look at the queue file. A local look answers in milliseconds; the file layer has no
+// timeout of its own, and a network mount that stops answering can hold a look forever. Two seconds is well past a
+// healthy look and well inside the 5-second tick, so a tick whose look gives up still starts its engine read in its
+// own period.
+const LOOK_TIMEOUT_MS = 2_000;
 
 // The refresh timer until a session start replaces it: stopping it does nothing.
 const NO_TIMER: Timer = { cancel: () => undefined };
@@ -544,13 +551,39 @@ async function lookAt($: EngineInterface, path: string): Promise<FileLook> {
     return stat === undefined ? { kind: 'unseeable' } : { kind: 'present', mtimeMs: stat.mtimeMs, size: stat.size };
 }
 
+// A look at the queue file that holds its caller no longer than LOOK_TIMEOUT_MS, one at a time. A look that does not
+// answer in time counts as unseeable (spec 2.3), so the pane reads through the engine, whose run has its own timeout
+// and reason (R4). While an earlier look still waits on the file layer, none other starts and the file counts as
+// unseeable, so at most one call waits there however long the file system hangs. The timer comes from
+// `$.clock.after`, whose wait does not count against the hook's budget as `$.clock.sleep` would.
+async function lookInTime($: EngineInterface, session: PaneSession, path: string): Promise<FileLook> {
+    if (session.isLooking) {
+        return { kind: 'unseeable' };
+    }
+    session.isLooking = true;
+    const looked = lookAt($, path).finally(() => {
+        session.isLooking = false;
+    });
+    const timedOut = deferred<FileLook>();
+    const timer = $.clock.after(LOOK_TIMEOUT_MS, () => timedOut.resolve({ kind: 'unseeable' }));
+    try {
+        return await Promise.race([looked, timedOut.promise]);
+    } finally {
+        timer.cancel();
+    }
+}
+
 // The look a read is gated on and remembered by, taken before the read so a write landing between the two costs one
 // more read instead of hiding until the minute (spec 2.2). The file looked at is the one `memo` names; a memo that
 // names none, or no memo, gives no look, and '' never reaches the file layer.
-async function lookBeforeRead($: EngineInterface, memo: GateMemo | undefined): Promise<QueueLook> {
+async function lookBeforeRead(
+    $: EngineInterface,
+    session: PaneSession,
+    memo: GateMemo | undefined,
+): Promise<QueueLook> {
     const cwd = await $.session.cwd();
     const path = memo?.path ?? '';
-    const file = path === '' ? undefined : await lookAt($, path);
+    const file = path === '' ? undefined : await lookInTime($, session, path);
     return { cwd, path, file, nowMs: await $.clock.now() };
 }
 
@@ -602,7 +635,7 @@ async function inFlight<T>(session: PaneSession, work: (isOvertaken: () => boole
 // show a queue nobody asked for at that moment.
 async function openPane($: EngineInterface, session: PaneSession): Promise<CommandRunResult> {
     const queue = await inFlight(session, async () => {
-        const look = await lookBeforeRead($, session.gate);
+        const look = await lookBeforeRead($, session, session.gate);
         const listed = await readQueue($, session);
         const selected = session.isPaneOpen
             ? reselect(await read($, queueState), listed, await read($, selectedState))
@@ -649,7 +682,7 @@ async function ringToRow($: EngineInterface, key: string): Promise<void> {
 // write. `closedKey` names the note a `d` or `x` of the pane just closed.
 async function refresh($: EngineInterface, session: PaneSession, closedKey?: string, look?: QueueLook): Promise<void> {
     await inFlight(session, async (isOvertaken) => {
-        const seen = look ?? (await lookBeforeRead($, session.gate));
+        const seen = look ?? (await lookBeforeRead($, session, session.gate));
         const queue = await readQueue($, session);
         const before = await read($, queueState);
         if (JSON.stringify(queue) === JSON.stringify(before)) {
@@ -673,19 +706,20 @@ async function refresh($: EngineInterface, session: PaneSession, closedKey?: str
 }
 
 // One period of the refresh timer (C1). It takes the session's folder and looks at the queue file, which starts no
-// process, and runs `rows` only when the gate says the queue may have changed (spec 2.2). It reads only while the
-// pane is open and no read is in flight, so a slow engine never stacks reads; both are checked again after the look,
-// which a close or another read can overtake, and the read then starts in the same step as the check. The look is
-// judged against the memo it was taken for: a read that settled meanwhile left a newer one, whose list is at least
-// as fresh. Nothing awaits a tick, so a failure goes to the debug log and the next period tries again. An engine
-// failure never gets here: it becomes the pane's header.
+// process, and runs `rows` only when the gate says the queue may have changed (spec 2.2). It runs only while the pane
+// is open, no read is in flight and no earlier look still waits on the file layer, so neither a slow engine nor a
+// hung file system stacks work. The open pane and the reads in flight are checked again after the look, which a close
+// or another read can overtake, and the read then starts in the same step as the check; a look that gave up still
+// waits on the file layer, so it is not checked again. The look is judged against the memo it was taken for: a read
+// that settled meanwhile left a newer one, whose list is at least as fresh. Nothing awaits a tick, so a failure goes
+// to the debug log and the next period tries again. An engine failure never gets here: it becomes the pane's header.
 async function tick($: EngineInterface, session: PaneSession): Promise<void> {
-    if (!session.isPaneOpen || session.readsInFlight > 0) {
+    if (!session.isPaneOpen || session.readsInFlight > 0 || session.isLooking) {
         return;
     }
     try {
         const memo = session.gate;
-        const look = await lookBeforeRead($, memo);
+        const look = await lookBeforeRead($, session, memo);
         if (!session.isPaneOpen || session.readsInFlight > 0 || !needsRead(memo, look.cwd, look.file, look.nowMs)) {
             return;
         }
@@ -985,6 +1019,7 @@ export const register: Register = (on, options) => {
         readsStarted: 0,
         refreshTimer: NO_TIMER,
         gate: undefined,
+        isLooking: false,
     };
 
     // The name is taken while a user-level skill or command named `later` exists; the toast says so and the rest of
