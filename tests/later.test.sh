@@ -15,6 +15,8 @@ source "$HERE/assert.sh"
 unset CLAUDE_PLUGIN_DATA CLAUDE_PLUGIN_OPTION_TERMINAL CLAUDE_PLUGIN_OPTION_FILE XDG_STATE_HOME
 # The lock cases choose the lock themselves.
 unset LATER_NO_FLOCK
+# The standard input cases set LATER_INPUT themselves, on their own runs.
+unset LATER_INPUT
 ENGINE="$HERE/../scripts/later.sh"
 # The PATH of every engine run, front-end runs included. CI narrows it to the
 # system folders, so the engine cannot lean on a tool the user installed.
@@ -452,6 +454,53 @@ assert_contains "$(lt "$gq" list)" "$(basename "$gq"): 1 parked" "refused --if f
 assert_eq "$(lt "$rw" done --if 'Check the S3 retry path' 1)" "later: done -> Check the S3 retry path" "--if compares the text without its stamp"
 assert_eq "$(lt "$rw" drop --if "split${T}here" 2)" "later: dropped -> split${T}here" "--if matches a text holding a tab"
 assert_contains "$(XDG_STATE_HOME="$T_STATE" PATH="$ENGINE_PATH" bash "$ENGINE" 2>&1)" "done [--if <text>] <n>..." "usage names the --if form"
+
+# --- user text on standard input --------------------------------------
+# Spec 1.8: with LATER_INPUT=stdin the note of add and the expected text of a
+# guarded done or drop come from standard input, byte for byte, never from an
+# argument, which Git for Windows' runtime would rewrite (@file, globs).
+
+# Runs the engine as lt does, with LATER_INPUT=stdin and <text> on standard
+# input, no newline added.
+lt_in() { # dir text args...
+    local dir="$1" text="$2"; shift 2
+    printf '%s' "$text" | LATER_INPUT=stdin lt "$dir" "$@"
+}
+
+si="$(mk_repo)"
+printf 'SECRET\n' > "$si/README.md"
+printf 'a\n' > "$si/a.md"
+for text in '@README.md' '*.md' '"quoted"' "it's" "C:\\x\\" '-x leading dash' 'შეამოწმე ექსპორტი'; do
+    assert_eq "$(lt_in "$si" "$text" add 2>&1)" "later: parked -> $text" "stdin add: $text is parked"
+    assert_eq "$(lt "$si" rows | sed -n '$p' | cut -f4-)" "$text" "stdin add: $text is stored byte for byte"
+done
+assert_eq "$(lt "$si" rows | count_lines)" "8" "stdin add: one note per run"
+before="$(file_digest "$si/$Q")"
+for text in '' '   ' $'\n\t\r\n'; do
+    assert_eq "$(lt_in "$si" "$text" add 2>&1)" "later: nothing to park (empty note)" "stdin add: an empty or blank input is refused"
+done
+assert_eq "$(file_digest "$si/$Q")" "$before" "stdin add: a refused note leaves the queue byte-identical"
+out="$(lt_in "$si" 'x' add extra 2>&1 >/dev/null; echo "exit $?")"
+assert_eq "$out" "later: add takes its note from standard input here"$'\n'"exit 1" "stdin add: an argument is refused on stderr"
+assert_eq "$(file_digest "$si/$Q")" "$before" "stdin add: a refused argument leaves the queue byte-identical"
+assert_eq "$(printf 'x' | LATER_INPUT=args lt "$si" add from the arguments 2>&1)" "later: parked -> from the arguments" "another LATER_INPUT value: add takes its arguments"
+
+sg="$(mk_repo)"
+printf '%s\n' '- [ ] ends here  ' '- [ ] other' > "$sg/$Q"
+before="$(file_digest "$sg/$Q")"
+out="$(lt_in "$sg" 'ends here' done --if 1 2>&1; echo "exit $?")"
+assert_eq "$out" "later: note 1 changed since it was listed; nothing changed"$'\n'"exit 1" "stdin --if: the text without its trailing spaces is refused"
+assert_eq "$(file_digest "$sg/$Q")" "$before" "stdin --if: a refused close leaves the queue byte-identical"
+assert_eq "$(lt_in "$sg" 'ends here  ' done --if 1 2>&1)" "later: done -> ends here  " "stdin --if: the exact text closes the note"
+assert_eq "$(sed -n 1p "$sg/$Q")" "- [x] ends here  " "stdin --if: done ticks the box and keeps the trailing spaces"
+before="$(file_digest "$sg/$Q")"
+out="$(lt_in "$sg" $'other\n' drop --if 1 2>&1; echo "exit $?")"
+assert_eq "$out" "later: note 1 changed since it was listed; nothing changed"$'\n'"exit 1" "stdin --if: a newline after the text is part of the text"
+out="$(lt_in "$sg" 'x' drop --if 1 2 2>&1 >/dev/null; echo "exit $?")"
+assert_eq "$out" "later: --if takes exactly one note number"$'\n'"exit 1" "stdin --if: two numbers are refused"
+out="$(lt_in "$sg" 'x' drop --if 2>&1 >/dev/null; echo "exit $?")"
+assert_eq "$out" "later: --if takes exactly one note number"$'\n'"exit 1" "stdin --if: no number is refused"
+assert_eq "$(file_digest "$sg/$Q")" "$before" "stdin --if: the refused forms leave the queue byte-identical"
 
 # --- line ends and the byte-order mark --------------------------------
 # Spec R5.3: a queue saved with CRLF line ends, or starting with a UTF-8

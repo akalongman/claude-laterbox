@@ -16,6 +16,15 @@
 #                    plus the oldest notes once per LATER_DIGEST_DAYS, and
 #                    the terminal command kept linked in ~/.local/bin
 #
+# LATER_INPUT=stdin moves the user's text from the arguments to standard
+# input, read whole and byte for byte: add takes no argument and parks the
+# input, and done|drop --if <n> takes one number and compares the input as
+# <text>. Git for Windows' runtime rewrites the arguments a native Windows
+# program passes to bash (an @file word becomes that file's contents, a word
+# holding a glob character is globbed), so the plugin's own callers set it.
+# The terminal command never does; any other value, or none, keeps the
+# argument forms.
+#
 # The queue file is LATER.local.md at the project's root, unless the
 # laterbox.file setting names another file (see resolve_queue_name).
 #
@@ -509,7 +518,15 @@ append_note() {
 
 cmd_add() {
     local note file
-    note=$(printf '%s' "$*" | tr '\n\r\t' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
+    if [ "${LATER_INPUT:-}" = stdin ]; then
+        [ $# -eq 0 ] || { echo 'later: add takes its note from standard input here' >&2; return 1; }
+        # The whole input, by the read builtin: no process. read fails at the
+        # end of the input, which is where it stops.
+        IFS= read -r -d '' note
+    else
+        note="$*"
+    fi
+    note=$(printf '%s' "$note" | tr '\n\r\t' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
     if [ -z "$note" ]; then
         echo 'later: nothing to park (empty note)'
         return 0
@@ -624,9 +641,15 @@ close_notes() {
 }
 
 cmd_close() {
-    local mode="$1" file; shift
+    local mode="$1" file expect; shift
     [ $# -gt 0 ] || { echo "later: $mode needs at least one note number" >&2; return 1; }
-    if [ "$1" = '--if' ] && [ $# -ne 3 ]; then
+    if [ "$1" = '--if' ] && [ "${LATER_INPUT:-}" = stdin ]; then
+        [ $# -eq 2 ] || { echo 'later: --if takes exactly one note number' >&2; return 1; }
+        # The text is the whole input, untrimmed, read before the lock is
+        # taken; close_notes then sees the argument form --if <text> <n>.
+        IFS= read -r -d '' expect
+        set -- --if "$expect" "$2"
+    elif [ "$1" = '--if' ] && [ $# -ne 3 ]; then
         echo 'later: --if takes exactly one note number' >&2
         return 1
     fi
