@@ -61,15 +61,20 @@ the transcript in fullscreen), and gives it the keys:
 
 `d` and `x` act only on a note that still reads as it was listed: when
 another writer changed or moved it, the pane says so and reads the queue
-again. While open, the pane reads the queue every five seconds. A session
-that shows no panes, such as `claude -p "/later"`, prints the list instead.
+again. While open, the pane looks at the queue file every five seconds,
+which starts no program, and reads the queue again when the file changed,
+after its own changes, when the session moved to another folder, and at
+least once a minute. A session that shows no panes, such as
+`claude -p "/later"`, prints the list instead.
 
 ### Asking in words: the skill
 
 Spoken requests ("what is parked", "do the second parked note", "tick that
 note off", "drop note 3", "park this for later") are handled by the skill
-`laterbox:notes`, which lists, parks, closes and drops notes through the same
-engine. It asks before it starts work on a parked note.
+`laterbox:notes`, which lists, parks, closes and drops notes through the
+plugin's tool `queue` and so through the same engine (see
+[What it runs](#what-it-runs)). It asks before it starts work on a parked
+note.
 
 ### The session-start line
 
@@ -143,20 +148,21 @@ does not) and a lock folder made with `mkdir` everywhere else.
 | Linux: Fedora | `sudo dnf install git` (bash comes with the system) |
 | Linux: Alpine and other BusyBox-based systems | Install bash and git (`apk add bash git` on Alpine). Untested: CI runs no BusyBox target. |
 | macOS | git from the Xcode command line tools (`xcode-select --install`); the system's bash 3.2 is enough. Nothing from Homebrew. |
-| Windows (native, PowerShell) | Not supported yet, planned for a later release. Use WSL. |
+| Windows (native, PowerShell) | Works in the Claude Code CLI: `/later`, the pane, the skill and the session-start line. Needs Git for Windows, which installing plugins already requires; laterbox finds its bash itself, with nothing to set up, and says at session start when it finds none. The terminal command `later` is not available on native Windows. |
 | WSL | The Linux rows apply. Use one environment per project, keep the project inside the WSL file system, and never park notes into one queue from WSL and from native Windows: their locks do not see each other. |
 
 CI runs the engine's test suite on Linux, on macOS with the engine limited to
 the system folders (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`), and on Windows
-under Git Bash ahead of native support. BusyBox systems and WSL are untested.
+under Git Bash. BusyBox systems and WSL are untested.
 
 ### Claude Code
 
-Laterbox needs Claude Code 2.1.296 or later. `/later` and its pane run in
-the terminal CLI: the plugin's hooks module starts the engine through process
-calls that Claude Code's module API marks as CLI only. The desktop app is
-untested. The session-start line appears in terminal sessions only; headless
-runs, the desktop app, IDE extensions and SDK hosts skip it.
+Laterbox needs Claude Code 2.1.296 or later. `/later`, its pane and the
+skill's tool run in the terminal CLI: the plugin's hooks module starts the
+engine through process calls that Claude Code's module API marks as CLI only.
+The desktop app is untested. The session-start line appears in terminal
+sessions only; headless runs, the desktop app, IDE extensions and SDK hosts
+skip it.
 
 ## What it runs, sends and writes
 
@@ -167,31 +173,100 @@ runs, the desktop app, IDE extensions and SDK hosts skip it.
   10-second timeout. It prints the session-start line, keeps the terminal
   link and stores the queue file setting.
 - A hooks module, `hooks/register.tsx`, that Claude Code loads. It registers
-  `/later`, draws the pane, runs `scripts/later.sh` as a process (no shell,
-  10-second timeout) and makes the rewrite's model calls.
-- The skill `laterbox:notes`, which runs `scripts/later.sh` with `list`,
-  `add`, `done` or `drop` as shell commands; its declaration allows exactly
-  these four.
+  `/later` and the tool `queue`, draws the pane, runs `scripts/later.sh` as a
+  process (no shell, 10-second timeout; on Windows through Git for Windows'
+  `bash.exe`) and makes the rewrite's model calls.
+- The skill `laterbox:notes`, which reaches the queue through the tool
+  `queue` alone, one call per listing or note; its declaration names that
+  tool and nothing else, and it names no shell command.
 - The terminal command, `scripts/later`, which runs `scripts/later.sh`.
 
 What the hooks module does, call by call:
 
-- **Hooks.** `session.start` registers `/later` and, while the pane is open,
-  re-reads the queue every five seconds. `command.run` answers `/later`
-  only: it parks a note or opens the pane. `ui.render`, `ui.focus` and
-  `ui.close` draw and drive its own pane only.
+- **Hooks.** `session.start` registers `/later` and the tool `queue`, reads
+  the variables below, and starts the timer that, while the pane is open,
+  looks at the queue file every five seconds. `command.run` answers `/later`
+  only: it parks a note or opens the pane. `tool.call` answers the tool
+  `queue` only. `ui.render`, `ui.focus` and `ui.close` draw and drive its
+  own pane only.
 - **The one program it starts** (`process.run`): the plugin's own engine,
   `scripts/later.sh` in the plugin's install folder, whose path is built
-  from that folder when it runs. The arguments are one subcommand (`add`,
-  `list`, `rows`, `done` or `drop`) and, for `add`, `done` and `drop`, the
-  note text or number. The environment variable `CLAUDE_PLUGIN_OPTION_FILE`
-  carries the queue file setting. Nothing else is run.
+  from that folder when it runs. On Linux and macOS it starts the script
+  directly; on Windows it starts Git for Windows' `bash.exe`, the one the
+  search below finds, with the script's path as its first argument. The
+  arguments are one subcommand (`add`, `list`, `rows`, `done` or `drop`)
+  and, for `done` and `drop`, `--if` and the note's number. The text of a
+  note to park, and the text a `done` or `drop` checks the note against,
+  reach the engine on standard input, not in the command, on every
+  platform: Git for Windows rewrites the command line a Windows program
+  hands to bash (a word that starts with `@` is replaced by the contents of
+  the file it names, a word with `*` or `?` is expanded), and standard
+  input passes the text unchanged. The environment variable
+  `CLAUDE_PLUGIN_OPTION_FILE` carries the queue file setting, and
+  `LATER_INPUT=stdin` tells the engine to read the text from standard
+  input. The engine runs in the session's working directory and finds the
+  queue from there. Nothing else is run.
 - **What it reads.** The conversation's newest messages
   (`session.messages`), only to build the rewrite's excerpt for the model
   call below; and its own pane state (the queue as listed, the selected
   note), only to draw the pane. Neither reaches the engine, which gets the
   note text alone, and neither leaves the machine except through the
   rewrite's model call described under [What it sends](#what-it-sends).
+- **The variables it reads** (`env.get`), once per session at its start, on
+  every platform: `OS`, `SHELL`, `CLAUDE_CODE_GIT_BASH_PATH`,
+  `ProgramFiles`, `ProgramW6432`, `ProgramFiles(x86)`, `LOCALAPPDATA` and
+  `PATH`. `OS` tells whether the host is Windows (`Windows_NT`); elsewhere
+  the other seven are not used. On Windows they locate Git for Windows'
+  `bash.exe` without starting a process. The search takes the first of
+  these that exists: the file `SHELL` names (Claude Code on Windows sets it
+  to the Git Bash it runs its hooks with), the file
+  `CLAUDE_CODE_GIT_BASH_PATH` names (Claude Code's own setting for that
+  bash), `Git\bin\bash.exe` under `ProgramFiles`, `ProgramW6432` and
+  `ProgramFiles(x86)` (Git for Windows installed for all users),
+  `Programs\Git\bin\bash.exe` under `LOCALAPPDATA` (installed for one
+  user), and, for each folder on `PATH` that holds `git.exe`,
+  `bin\bash.exe` in that folder's parent. For every file named here,
+  `git.exe` included, the module only asks whether it exists; it opens none
+  of them. A bash candidate counts only when it has a folder part, its file
+  name is `bash.exe`, `sh.exe`, `bash` or `sh`, and it is not under
+  `System32`, `SysWOW64` or `WindowsApps`, which hold WSL's `bash.exe`. A
+  variable the module cannot read counts as unset. When the search finds no
+  bash, a line at session start says to install Git for Windows, and
+  `/later`, the pane and the tool give the same reason.
+- **The queue file's timestamp and size.** While the pane is open, every
+  five seconds: the session's working directory (`session.cwd`), and
+  whether the queue file exists, with its modification time and size
+  (`fs.exists`, `fs.stat`), never its content. The file is the one the
+  engine named in its last listing. The pane runs the engine's `rows` again
+  when the folder or the file changed, after its own changes, and at least
+  once a minute; none of the looks starts a process. A look the file layer
+  refuses (a network location, an access refusal), or one that does not
+  answer within two seconds, counts as unseen, and the pane then reads the
+  queue on every tick; while a look still waits for its answer, no other
+  look starts. Before `w`, `d` or `x` the pane compares the working
+  directory with the one its list came from, and when they differ it lists
+  the queue again instead of acting.
+- **The tool it registers** (`tool.register`): `queue`, shown in Claude
+  Code as `mcp__laterbox__queue` and offered to the model in every session.
+  Each call runs the same engine as `/later`, as above, in one of four
+  ways: `list` lists the open notes; `add` parks one note, sent on standard
+  input; `done` marks one note done and `drop` drops one, each named by its
+  number and its text in a fresh listing, with `--if` and the number as
+  arguments and the text on standard input, so that when the note at that
+  number no longer has that text, nothing changes and the call is refused.
+  A call with another action, an empty note, or a `done` or `drop` without
+  a whole number of 1 or more and a text is refused with a one-line reason
+  starting `later:`, and nothing runs. The module serves the tool itself:
+  its `tool.call` hook answers each call with the engine's output or a
+  refusal before Claude Code's permission step, so the tool shows no
+  permission dialog, and a permission rule you write for
+  `mcp__laterbox__queue`, allow or deny, is not consulted: a deny rule does
+  not stop it. To keep the tool from running, disable the plugin
+  (`/plugin`, or `claude plugin disable laterbox@akalongman`) or uninstall
+  it (see [Uninstall](#uninstall)). Of your files, the tool touches only the
+  project's queue file, the one `/later` uses (the engine also keeps its
+  lock and stored setting, as [What it writes](#what-it-writes) says): it
+  takes no path and runs no command but the engine.
 - **The prompt draft.** `w` (or Enter on a row) puts the note's text at the
   end of the prompt draft; nothing is sent.
 
@@ -219,9 +294,10 @@ The rewrite is the only model call the plugin makes itself. Only
 
 Both model calls go through Claude Code's own model access. Beyond them,
 what the plugin adds to the conversation goes to the model with the rest of
-the session: the output row of `/later` with its hidden note, and the output
-of the skill's commands. The plugin opens no network connection of its own;
-the engine and the terminal command make no network access.
+the session: the output row of `/later` with its hidden note, the tool
+`queue`'s description, which Claude Code offers to the model in every
+session, and the tool's results. The plugin opens no network connection of
+its own; the engine and the terminal command make no network access.
 
 ### What it writes
 
@@ -246,8 +322,7 @@ the engine and the terminal command make no network access.
   lock its writers take turns through.
 - **The stored setting `~/.local/state/later/queue-file`**
   (`$XDG_STATE_HOME/later/` when that is set): a copy of `laterbox.file`, for
-  the terminal command and the skill, which cannot read Claude Code's
-  settings.
+  the terminal command, which cannot read Claude Code's settings.
 
 The plugin writes no git ignore file, git configuration, shell startup file
 or `PATH`.
@@ -287,8 +362,8 @@ in it as a parked note. The name must be one plain file name: not empty, not
 session-start message says so at every session start until it is fixed.
 
 The setting is one value for every project, and one value per person. The
-terminal command and the skill read the stored copy, which every session
-start and every run from `/later` or the pane refresh. If you use more than
+terminal command reads the stored copy, which every session start and every
+run from `/later`, the pane or the skill's tool refresh. If you use more than
 one Claude Code configuration folder, give every one the same value: the
 terminal follows whichever ran last. Clearing the setting returns every entry
 point to `LATER.local.md` at the next session start.
