@@ -14,7 +14,8 @@ const ACTION_REASON = 'action must be list, add, done or drop';
 const ADD_REASON = 'add needs a note that is not empty';
 const CLOSE_REASON = "done and drop need a whole note number of 1 or more and the note's text";
 
-// What the model reads about the tool: the four actions, the guard of a close, and what its refusal means.
+// What the model reads about the tool: the four actions, the guard of a close and the text it names, and what its
+// refusal means.
 export const TOOL_DESCRIPTION = [
     "Lists, adds, closes and drops the project's parked notes: follow-ups the user saved for a later session,",
     'reminders rather than tasks for now.',
@@ -22,6 +23,9 @@ export const TOOL_DESCRIPTION = [
     'action "add" parks the text given as note.',
     'action "done" closes a note as finished and action "drop" drops one no longer needed: each acts on one note,',
     'named by its number and its exact text from a fresh listing.',
+    "The text is the listing line's text between its number and the age in parentheses that ends the line",
+    '("(today)", "(3d)", "(undated)"), copied exactly: the number and the age are not part of it, and the note\'s',
+    'own parentheses are.',
     'A done or drop refused because the note "changed since it was listed" means the queue changed after that',
     'listing and nothing was closed: list again.',
 ].join(' ');

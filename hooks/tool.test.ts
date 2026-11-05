@@ -102,9 +102,12 @@ test('the input schema names the four actions and their fields', async () => {
     });
 });
 
-test('the description names the four actions and the guard', async () => {
+test('the description names the four actions, the guard and what the text is', async () => {
     for (const word of ['list', 'add', 'done', 'drop', 'number', 'exact text', 'refus']) {
         expect(TOOL_DESCRIPTION).toContain(word);
+    }
+    for (const words of ['between its number and the age in parentheses', '"(3d)"', 'not part of it']) {
+        expect(TOOL_DESCRIPTION).toContain(words);
     }
     expect(TOOL_DESCRIPTION).not.toMatch(/[\u2013\u2014]/);
 });
