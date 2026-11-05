@@ -247,7 +247,8 @@ What the hooks module does, call by call:
   directory with the one its list came from, and when they differ it lists
   the queue again instead of acting.
 - **The tool it registers** (`tool.register`): `queue`, shown in Claude
-  Code as `mcp__laterbox__queue` and offered to the model in every session.
+  Code as `mcp__laterbox__queue` and offered to the model in every session
+  that does not deny it (below).
   Each call runs the same engine as `/later`, as above, in one of four
   ways: `list` lists the open notes; `add` parks one note, sent on standard
   input; `done` marks one note done and `drop` drops one, each named by its
@@ -259,11 +260,16 @@ What the hooks module does, call by call:
   starting `later:`, and nothing runs. The module serves the tool itself:
   its `tool.call` hook answers each call with the engine's output or a
   refusal before Claude Code's permission step, so the tool shows no
-  permission dialog, and a permission rule you write for
-  `mcp__laterbox__queue`, allow or deny, is not consulted: a deny rule does
-  not stop it. To keep the tool from running, disable the plugin
-  (`/plugin`, or `claude plugin disable laterbox@akalongman`) or uninstall
-  it (see [Uninstall](#uninstall)). Of your files, the tool touches only the
+  permission dialog and needs no allow rule. A deny rule for
+  `mcp__laterbox__queue` is the way to block the tool, for example
+  `{"permissions": {"deny": ["mcp__laterbox__queue"]}}` in a Claude Code
+  settings file: Claude Code then withholds the tool from the session, so
+  the model is never offered it and no call reaches the module, and the
+  skill tells you the tool is not available instead of reaching the queue
+  another way. The other way, which also turns off `/later`, the pane and
+  the session-start line, is to disable the plugin (`/plugin`, or
+  `claude plugin disable laterbox@akalongman`) or uninstall it (see
+  [Uninstall](#uninstall)). Of your files, the tool touches only the
   project's queue file, the one `/later` uses (the engine also keeps its
   lock and stored setting, as [What it writes](#what-it-writes) says): it
   takes no path and runs no command but the engine.
