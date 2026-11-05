@@ -106,7 +106,7 @@ test('the description names the four actions, the guard and what the text is', a
     for (const word of ['list', 'add', 'done', 'drop', 'number', 'exact text', 'refus']) {
         expect(TOOL_DESCRIPTION).toContain(word);
     }
-    for (const words of ['between its number and the age in parentheses', '"(3d)"', 'not part of it']) {
+    for (const words of ['between its number and the age in parentheses', '"(3d)"', 'not part of it', 'the text is "renew the certificate"']) {
         expect(TOOL_DESCRIPTION).toContain(words);
     }
     expect(TOOL_DESCRIPTION).not.toMatch(/[\u2013\u2014]/);

@@ -26,6 +26,7 @@ export const TOOL_DESCRIPTION = [
     "The text is the listing line's text between its number and the age in parentheses that ends the line",
     '("(today)", "(3d)", "(undated)"), copied exactly: the number and the age are not part of it, and the note\'s',
     'own parentheses are.',
+    'For the line " 2. renew the certificate (3d)" the text is "renew the certificate".',
     'A done or drop refused because the note "changed since it was listed" means the queue changed after that',
     'listing and nothing was closed: list again.',
 ].join(' ');
