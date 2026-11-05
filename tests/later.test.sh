@@ -428,12 +428,49 @@ printf '%s\n' '# Parked notes (`/later`)' '' \
     '- [ ] undated one' > "$rw/$Q"
 printf -- '- [ ] split\there\n' >> "$rw/$Q"
 out="$(lt "$rw" rows)"
-assert_eq "$(printf '%s\n' "$out" | sed -n 1p)" "queue${T}$(basename "$rw")" "rows starts with the queue line"
+assert_eq "$(printf '%s\n' "$out" | sed -n 1p | cut -f1,2)" "queue${T}$(basename "$rw")" "rows starts with the queue line"
 assert_eq "$(printf '%s\n' "$out" | sed -n 2p)" "note${T}1${T}3d${T}Check the S3 retry path" "rows: position, age, text without the stamp"
 assert_eq "$(printf '%s\n' "$out" | sed -n 3p)" "note${T}2${T}undated${T}undated one" "rows leaves closed notes out"
 assert_eq "$(printf '%s\n' "$out" | sed -n 4p)" "note${T}3${T}undated${T}split${T}here" "rows keeps a tab inside a note's text"
 assert_eq "$(printf '%s\n' "$out" | count_lines)" "4" "rows prints nothing else"
-assert_eq "$(lt "$e" rows)" "queue${T}$(basename "$e")" "rows without a queue file prints the queue line alone"
+eout="$(lt "$e" rows)"
+assert_eq "$(printf '%s\n' "$eout" | cut -f1,2)" "queue${T}$(basename "$e")" "rows without a queue file prints the queue line alone"
+
+# Spec 2.1: the queue line ends in a third field, the queue file's absolute
+# path, printed whether or not the file exists, which the pane watches
+# through the module's file layer. A tab in the label becomes a space, so the
+# path is always the third field. Linux and macOS print the path as the
+# shell spells it; Git Bash prints its Windows form with forward slashes,
+# which cygpath -u turns back into the shell's.
+rows_path() { printf '%s\n' "$1" | sed -n 1p | cut -f3-; } # rows output
+tb="$(mk_tmpdir)/tab${T}name"; mv "$(mk_repo)" "$tb"
+assert_eq "$(lt "$tb" rows | cut -f1,2)" "queue${T}tab name" "rows: a tab in the label becomes a space"
+if [ "$PLATFORM" = gitbash ]; then
+    for wd in "$rw" "$e"; do
+        qp="$(rows_path "$(lt "$wd" rows)")"
+        assert_ok "rows under Git Bash: the queue path is a Windows path with forward slashes ($qp)" grep -qE '^[A-Za-z]:/' <<< "$qp"
+        assert_eq "$(cygpath -u "$qp")" "$(cd -P "$wd" && pwd)/$Q" "rows under Git Bash: cygpath -u of the queue path is the queue file's path (${wd##*/})"
+    done
+else
+    assert_eq "$(rows_path "$out")" "$(cd -P "$rw" && pwd)/$Q" "rows: the queue line ends in the queue file's absolute path"
+    assert_eq "$(rows_path "$eout")" "$(cd -P "$e" && pwd)/$Q" "rows without a queue file: the queue line still names the queue file's path"
+    assert_eq "$(rows_path "$(lt "$tb" rows)")" "$(cd -P "$tb" && pwd)/$Q" "rows: a tab in the folder's name stays in the path"
+    skip "rows: the queue path in its Windows form: Git Bash only"
+fi
+
+# Review Focus 3: a queue in a folder whose name holds a space and non-ASCII
+# letters. The queue line names it byte for byte, in a UTF-8 locale and
+# under LC_ALL=C alike.
+np="$(mk_tmpdir)/ნინო proj"; mv "$(mk_repo)" "$np"
+printf '%s\n' '- [ ] one' > "$np/$Q"
+for loc in '' C; do
+    out="$(LC_ALL=$loc lt "$np" rows)"
+    assert_eq "$(printf '%s\n' "$out" | sed -n 1p | cut -f1,2)" "queue${T}ნინო proj" "a folder named ნინო proj (${loc:+LC_ALL=}${loc:-default locale}): the label"
+    qp="$(rows_path "$out")"
+    [ "$PLATFORM" != gitbash ] || qp="$(cygpath -u "$qp")"
+    assert_eq "$qp" "$(cd -P "$np" && pwd)/$Q" "a folder named ნინო proj (${loc:+LC_ALL=}${loc:-default locale}): the queue line names the queue file exactly"
+done
+
 gone="$(mktemp -d)"
 out="$( cd "$gone" && rmdir "$gone" && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" PATH="$ENGINE_PATH" bash "$ENGINE" rows 2>&1; echo "exit $?" )"
 assert_contains "$out" "later: cannot resolve the queue here" "rows names an unresolvable queue"
@@ -635,6 +672,19 @@ else
     ln -s "$ltarget/gone.md" "$lroot/dangling/$Q"
     ln -s "$ltarget/$Q" "$lroot/tofolder/$Q"
     assert_eq "$(all "$lroot")" "  1 open, oldest undated   $lroot/p"$'\n'"  1 open in 1 queues" "all skips a dangling link, a link to a folder and a folder named like the queue"
+fi
+
+# Spec 1.7: under Git Bash the engine puts Git's /usr/bin before Windows'
+# system folders, so a PATH that starts with System32 cannot hand all
+# Windows' find.exe and sort.exe. The engine's bash is started by its own
+# path here, because System32 can hold WSL's bash.exe.
+if [ "$PLATFORM" = gitbash ]; then
+    s32="$(mk_tmpdir)"; mkdir -p "$s32/p"
+    printf '%s\n' '- [ ] one open' > "$s32/p/$Q"
+    out="$( cd / && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" TZ="$ZONE" LATER_NOW="$NOW" LATER_ROOTS="$s32" PATH="/c/Windows/System32:$ENGINE_PATH" "$BASH" "$ENGINE" all )"
+    assert_eq "$out" "  1 open, oldest undated   $s32/p"$'\n'"  1 open in 1 queues" "all with System32 first on PATH lists the queue, by Git's find and sort"
+else
+    skip "all with System32 first on PATH: Git Bash only"
 fi
 
 # --- session-start ----------------------------------------------------

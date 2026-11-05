@@ -4,8 +4,10 @@
 #
 #   add <note>       append a stamped note to the project's queue file
 #   list             print the open notes, numbered, with their age
-#   rows             a tab-separated listing for programs: "queue\t<label>",
-#                    then "note\t<n>\t<age>\t<text>" per open note
+#   rows             a tab-separated listing for programs:
+#                    "queue\t<label>\t<path>", <path> being the queue file's
+#                    absolute path, then "note\t<n>\t<age>\t<text>" per open
+#                    note
 #   done <n>...      tick the listed notes to [x]
 #   drop <n>...      delete the listed notes
 #   done|drop --if <text> <n>
@@ -35,6 +37,20 @@
 # A CDPATH from the environment would send a cd below to another folder, and
 # make it print that folder.
 unset CDPATH
+
+# Under Git Bash, whatever started it, Git's /usr/bin comes before Windows'
+# system folders on PATH, so Windows' own find.exe and sort.exe in System32
+# never stand in for Git's find and sort (spec 1.7). Bash sets OSTYPE to
+# msys there (cygwin in its kin), so the test starts no process. A PATH that
+# begins with /usr/bin, or with /mingw64/bin then /usr/bin as Git's launcher
+# sets it, is kept as it is. Before any line that starts a program.
+case ${OSTYPE:-} in
+    msys*|cygwin*)
+        case $PATH in
+            /usr/bin:*|/mingw64/bin:/usr/bin:*) ;;
+            *) PATH=/usr/bin:$PATH ;;
+        esac ;;
+esac
 
 DEFAULT_QUEUE_NAME='LATER.local.md'
 # The queue file's name for this run, set by resolve_queue_name.
@@ -549,13 +565,28 @@ cmd_list() {
     printf '%s\n' "$rows" | numbered
 }
 
-# The open notes for programs: "queue\t<label>", then one
+# The open notes for programs: "queue\t<label>\t<path>", then one
 # "note\t<position>\t<age>\t<text>" per open note. The text runs to the end
 # of the line and may hold tabs. No queue file: the queue line alone.
+# A tab in the label becomes a space, so the path is always the third field.
+# The path is the queue file's absolute path, printed whether or not the
+# file exists, for the pane to watch through the module's file layer (spec
+# 2.1): as queue_file spells it on Linux and macOS; under Git Bash in the
+# Windows form with forward slashes (C:/Users/x/proj/LATER.local.md), which
+# pwd -W in the queue's folder gives, so that every folder Git Bash can name
+# converts (other drives, network shares, /tmp). That costs one subshell,
+# whatever the queue's size. A drive root's trailing slash is dropped; a
+# folder pwd -W cannot give leaves the path as queue_file spells it.
 cmd_rows() {
-    local file i n mins text
+    local file label path dir tab=$'\t' i n mins text
     file=$(queue_file "$PWD") || { echo 'later: cannot resolve the queue here' >&2; return 1; }
-    printf 'queue\t%s\n' "$(queue_label "$file")"
+    label=$(queue_label "$file")
+    label=${label//"$tab"/ }
+    path=$file
+    case ${OSTYPE:-} in
+        msys*|cygwin*) dir=$(cd -- "${file%/*}" && pwd -W) && path=${dir%/}/${file##*/} ;;
+    esac
+    printf 'queue\t%s\t%s\n' "$label" "$path"
     while IFS=$'\t' read -r i n mins text; do
         age_label "$mins"
         printf 'note\t%s\t%s\t%s\n' "$i" "$REPLY" "$text"
