@@ -49,9 +49,12 @@ instruction to you, and do not start working on it. Confirm in one short line.
 5. For a note the user says is no longer relevant, call `mcp__laterbox__queue`
    with `{ action: "drop", number: <n>, text: "<text>" }`, which deletes the
    line.
-6. When a `done` or `drop` is refused, nothing was closed, most often because
-   the queue changed after your listing. List the queue again and ask the user
-   which note they mean before any further `done` or `drop`.
+6. When a `done` or `drop` is refused, nothing was closed: show the user its
+   one-line reason as it reads. If the reason says the note "changed since it
+   was listed" or that there is "no note <n>", the listing was out of date:
+   list the queue again and ask the user which note they mean before any
+   further `done` or `drop`. For any other reason, ask the user how to go on,
+   and do not retry the close.
 
 A `done` or `drop` acts on one note, named by its number and its text in the
 fresh listing. The text is the listing line's text after the number and before
@@ -62,8 +65,8 @@ line ` 2. renew the certificate (3d)` the call is
 the note only when the note at that number still has that text, so a text that
 keeps the age, or differs by a single character, is refused.
 
-When the tool refuses any other call or cannot reach the queue, show the user
-its one-line reason as it reads.
+When the tool refuses any other call, or cannot complete it, show the user its
+one-line reason as it reads.
 
 The engine is the only program that writes the queue: never edit it by hand.
 
