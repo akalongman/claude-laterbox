@@ -963,6 +963,23 @@ for (const surface of SURFACES) {
     });
 }
 
+// On mobile the pane draws no `add`: the floor's mobile table has no `Input`, and a later one's draws as an empty Box
+// in an app that did not ask for it. Every other action stays.
+test('on mobile the pane draws every action but add', async ($, on) => {
+    stage(on);
+    await $.session.start(SESSION);
+    await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
+    const ui = await $.ui.mount({
+        plugin: 'laterbox',
+        surface: 'mobile',
+        component: 'Pane',
+        requestId: PANE_ID,
+        props: PANE_PROPS,
+    });
+    const keys = (await ui.findAll({ type: 'Button' })).map((button) => button.key ?? '');
+    expect(keys).toEqual([key(CHECK), key(ASK), key(RAISE), 'work', 'done', 'drop', 'next', 'previous']);
+});
+
 // The first tick reads once more, since the open's read had no file to look at; the second reads the changed queue.
 test('the open pane looks every five seconds and shows a changed queue', async ($, on) => {
     const queue = liveQueue([CHECK]);

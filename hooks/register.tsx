@@ -104,9 +104,12 @@ const LOOK_TIMEOUT_MS = 2_000;
 // The refresh timer until a session start replaces it: stopping it does nothing.
 const NO_TIMER: Timer = { cancel: () => undefined };
 
-// Whether each surface's element table has an `Input`, checked against the declared tables. The table `$.ui.resolve`
-// hands out at run time holds every element name (an omitted one draws a fragment), so it cannot be asked.
-const TAKES_INPUT: { readonly [S in RenderSurface]: 'Input' extends keyof Elements[S] ? true : false } = {
+// Whether the pane draws an `Input` on each surface. The declared tables check it one way: `true` only where the
+// surface's table declares an `Input`, so `hasInput` narrows soundly; `false` is allowed on any surface and only
+// leaves out `add`. The table `$.ui.resolve` hands out at run time holds every element name (an omitted one draws a
+// fragment), so it cannot be asked. Mobile stays `false` on every host: the floor's (2.1.296) mobile table has no
+// `Input`, and where a later Claude Code's has one, a mobile app that did not ask to draw it gets an empty Box.
+const TAKES_INPUT: { readonly [S in RenderSurface]: 'Input' extends keyof Elements[S] ? boolean : false } = {
     terminal: true,
     desktop: true,
     mobile: false,
@@ -116,7 +119,7 @@ const TAKES_INPUT: { readonly [S in RenderSurface]: 'Input' extends keyof Elemen
 // The surfaces whose element table has an `Input`.
 type InputSurface = { [S in RenderSurface]: 'Input' extends keyof Elements[S] ? S : never }[RenderSurface];
 
-// Whether the pane is drawn where an `Input` can be (C15). Narrowed by it, `$.ui.resolve(e)` hands out one.
+// Whether the pane draws an `Input` on its surface (C15). Narrowed by it, `$.ui.resolve(e)` hands one out.
 function hasInput(e: RenderInput<'Pane'>): e is RenderInput<'Pane', InputSurface> {
     return TAKES_INPUT[e.surface];
 }
