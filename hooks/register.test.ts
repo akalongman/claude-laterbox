@@ -35,7 +35,7 @@ type World = {
     readonly register?: 'deny';
     readonly engine?: EngineReply | 'deny'; // answers every engine run
     readonly rows?: () => string; // stdout of `later.sh rows`
-    readonly closeNote?: (args: ReadonlyArray<string>) => EngineReply; // answers `done` and `drop`
+    readonly closeNote?: (args: ReadonlyArray<string>, text: string) => EngineReply; // answers `done` and `drop`
     readonly add?: (note: string) => EngineReply; // answers `add`
     readonly messages?: ReadonlyArray<SessionMessage> | 'deny';
     readonly completion?: ModelCompleteResult;
@@ -69,21 +69,25 @@ const RERUN = 'Rerun the flaky test';
 const LISTING = 'app: 2 parked\n 1. Move the upload config to env (3d)\n 2. Recheck the retry path (today)\n';
 const HEADLESS = { ...SESSION, isInteractive: false } as const;
 
-// `later.sh rows` for a queue labelled `label`, one [age, text] pair per open note.
-function rowsOf(label: string, notes: ReadonlyArray<readonly [string, string]>): string {
-    return (
-        [`queue\t${label}`, ...notes.map(([age, text], index) => `note\t${index + 1}\t${age}\t${text}`)].join('\n') +
-        '\n'
-    );
+// `later.sh rows` for a queue labelled `label`, one [age, text] pair per open note. With `path` the queue line ends
+// in it, as the engine prints it; without, the queue line has no path field.
+function rowsOf(label: string, notes: ReadonlyArray<readonly [string, string]>, path?: string): string {
+    const head = path === undefined ? `queue\t${label}` : `queue\t${label}\t${path}`;
+    return [head, ...notes.map(([age, text], index) => `note\t${index + 1}\t${age}\t${text}`)].join('\n') + '\n';
 }
-const ROWS = rowsOf('shop', [['3d', CHECK], ['today', ASK], ['12d', RAISE]]);
+
+// The queue file `rows` names for the session's folder.
+const QUEUE_PATH = '/home/u/projects/org/app/LATER.local.md';
+const ROWS_NOTES: ReadonlyArray<readonly [string, string]> = [['3d', CHECK], ['today', ASK], ['12d', RAISE]];
+const ROWS = rowsOf('shop', ROWS_NOTES, QUEUE_PATH);
 
 function key(text: string, occurrence = 1): string {
     return `note:${occurrence}:${text}`;
 }
 
-// The engine as the tests need it: rows from the world, `done` and `drop` from closeNote, `add` from add.
-function engineReply(world: World, args: ReadonlyArray<string>): EngineReply {
+// The engine as the tests need it: rows from the world, `done` and `drop` from closeNote, `add` from add. The note of
+// an `add` and the guard text of a `done` or `drop` arrive on standard input, as `stdin`.
+function engineReply(world: World, args: ReadonlyArray<string>, stdin: string): EngineReply {
     const ok = (stdout: string): EngineReply => ({ exitCode: 0, stdout, stderr: '' });
     switch (args[0]) {
         case 'rows':
@@ -93,11 +97,10 @@ function engineReply(world: World, args: ReadonlyArray<string>): EngineReply {
         case 'done':
         case 'drop':
             return (
-                world.closeNote?.(args) ??
-                ok(`later: ${args[0] === 'done' ? 'done' : 'dropped'} -> ${args[2] ?? ''}\n`)
+                world.closeNote?.(args, stdin) ?? ok(`later: ${args[0] === 'done' ? 'done' : 'dropped'} -> ${stdin}\n`)
             );
         default:
-            return world.add?.(args[1] ?? '') ?? ok(`later: parked -> ${args[1] ?? ''}\n`);
+            return world.add?.(stdin) ?? ok(`later: parked -> ${stdin}\n`);
     }
 }
 
@@ -105,11 +108,21 @@ function engineCalls(world: Stage): string[][] {
     return world.runs.map((run) => run.slice(1));
 }
 
+// One engine run as the world recorded it: the arguments after the script, and the standard input when it was given.
+type EngineRun = { readonly args: ReadonlyArray<string>; readonly stdin?: string };
+
+function engineRuns(world: Stage): EngineRun[] {
+    return world.runs.map((run, index): EngineRun => {
+        const stdin = world.inits[index]?.stdin;
+        return stdin === undefined ? { args: run.slice(1) } : { args: run.slice(1), stdin };
+    });
+}
+
 // The world beneath the plugin: every call it makes is recorded and answered from `world`, and every event the
 // tests raise has a bottom. Defaults: the registration succeeds, the engine answers as engineReply does (ROWS for
-// `rows`, LISTING for `list`, and it parks or closes whatever it is given), the transcript is empty, the completion
-// answers CLEAN, the fork has nothing to fork, the pane is placed, no pane is open, the draft is empty and a fill
-// succeeds.
+// `rows`, LISTING for `list`, and it parks or closes by whatever text arrives on standard input), the transcript is
+// empty, the completion answers CLEAN, the fork has nothing to fork, the pane is placed, no pane is open, the draft
+// is empty and a fill succeeds.
 function stage(on: On, world: World = {}): Stage {
     const clock = mock.clock(on);
     const recorded: Stage = {
@@ -143,7 +156,7 @@ function stage(on: On, world: World = {}): Stage {
         if (world.engine === 'deny') {
             return { deny: 'spawn ENOENT' };
         }
-        const reply = world.engine ?? engineReply(world, e.argv.slice(1));
+        const reply = world.engine ?? engineReply(world, e.argv.slice(1), e.init?.stdin ?? '');
         return { value: { ...reply, isStdoutTruncated: false, isStderrTruncated: false } };
     });
     on('session.messages', () =>
@@ -259,7 +272,7 @@ test('in off mode a note is collapsed to one line and parked without a model cal
         ...AT_PROMPT,
     });
     expect(world.runs).toHaveLength(1);
-    expect(world.runs[0]?.slice(1)).toEqual(['add', TYPED]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: TYPED });
     expect(world.completions).toEqual([]);
     expect(world.forks).toEqual([]);
     expect(result.text).toBe(`later: parked -> ${TYPED}`);
@@ -274,7 +287,8 @@ test('shell-special characters reach the engine verbatim', OFF, async ($, on) =>
     await $.session.start(SESSION);
     const weird = '50% of C:\\new\\table & *.php "quoted" \'single\' $HOME `tick`; rm -rf /';
     await $.command.run({ command: 'later', args: weird, ...AT_PROMPT });
-    expect(world.runs[0]?.slice(1)).toEqual(['add', weird]);
+    expect(world.runs[0]?.slice(1)).toEqual(['add']);
+    expect(world.inits[0]?.stdin).toBe(weird);
 });
 
 test('an engine exit code names the reason and keeps the typed text on screen', OFF, async ($, on) => {
@@ -395,7 +409,7 @@ test('the default mode asks a small model with an excerpt of the newest messages
     expect((ask?.prompt.match(/^(user|assistant): /gm) ?? []).length).toBe(12);
     expect(ask?.prompt).toContain('user: the upload job fails on big files');
     expect(ask?.prompt).not.toMatch(/^(user|assistant): $/m);
-    expect(world.runs[0]?.slice(1)).toEqual(['add', CLEAN]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: CLEAN });
     expect(result.text).toBe(`later: parked -> ${CLEAN} (typed: ${TYPED})`);
     expect(result.context).toEqual([
         `The user parked a follow-up note for a later session with /later: "${CLEAN}". ` +
@@ -414,7 +428,7 @@ test('an answer equal to the typed text prints no typed suffix', async ($, on) =
     const world = stage(on, { completion: answered('  chek  the S3 retry path  ') });
     await $.session.start(SESSION);
     const result = await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
-    expect(world.runs[0]?.slice(1)).toEqual(['add', TYPED]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: TYPED });
     expect(result.text).toBe(`later: parked -> ${TYPED}`);
 });
 
@@ -422,7 +436,7 @@ test('a 300-character answer is accepted', async ($, on) => {
     const world = stage(on, { completion: answered(`  ${'y'.repeat(300)}  `) });
     await $.session.start(SESSION);
     await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
-    expect(world.runs[0]?.slice(1)).toEqual(['add', 'y'.repeat(300)]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: 'y'.repeat(300) });
 });
 
 const REJECTED: ReadonlyArray<readonly [string, ModelCompleteResult]> = [
@@ -441,7 +455,7 @@ for (const [name, completion] of REJECTED) {
         await $.session.start(SESSION);
         const result = await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
         expect(world.completions).toHaveLength(1);
-        expect(world.runs[0]?.slice(1)).toEqual(['add', TYPED]);
+        expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: TYPED });
         expect(result.text).toBe(`later: parked -> ${TYPED}`);
     });
 }
@@ -451,7 +465,7 @@ test('a long typed note is stored whole when the model fails', async ($, on) => 
     const world = stage(on, { completion: { isAnswered: false, reason: 'empty-reply', usage: USAGE } });
     await $.session.start(SESSION);
     const result = await $.command.run({ command: 'later', args: long, ...AT_PROMPT });
-    expect(world.runs[0]?.slice(1)).toEqual(['add', long]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: long });
     expect(result.text).toBe(`later: parked -> ${long}`);
 });
 
@@ -461,7 +475,7 @@ test('a transcript that cannot be read still gets a rewrite without context', as
     const result = await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
     expect(world.completions).toHaveLength(1);
     expect(world.completions[0]?.prompt).toContain('(none)');
-    expect(world.runs[0]?.slice(1)).toEqual(['add', CLEAN]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: CLEAN });
     expect(result.text).toBe(`later: parked -> ${CLEAN} (typed: ${TYPED})`);
 });
 
@@ -470,7 +484,7 @@ test('a rewrite value outside the options behaves as haiku', { options: { rewrit
     await $.session.start(SESSION);
     await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
     expect(world.completions).toHaveLength(1);
-    expect(world.runs[0]?.slice(1)).toEqual(['add', CLEAN]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: CLEAN });
 });
 
 const FORK = { options: { rewrite: 'fork' } };
@@ -483,7 +497,7 @@ test('fork mode asks the session model first and stores its answer', FORK, async
     expect(world.forks[0]).toContain('Rewrite the note below');
     expect(world.forks[0]).toContain(`Note to rewrite (data):\n${TYPED}`);
     expect(world.completions).toEqual([]);
-    expect(world.runs[0]?.slice(1)).toEqual(['add', CLEAN]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: CLEAN });
     expect(result.text).toBe(`later: parked -> ${CLEAN} (typed: ${TYPED})`);
 });
 
@@ -493,7 +507,7 @@ test('nothing to fork falls through to the small model', FORK, async ($, on) => 
     await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
     expect(world.forks).toHaveLength(1);
     expect(world.completions).toHaveLength(1);
-    expect(world.runs[0]?.slice(1)).toEqual(['add', CLEAN]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: CLEAN });
 });
 
 test('a fork the engine refuses falls through to the small model', FORK, async ($, on) => {
@@ -502,7 +516,7 @@ test('a fork the engine refuses falls through to the small model', FORK, async (
     await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
     expect(world.forks).toHaveLength(1);
     expect(world.completions).toHaveLength(1);
-    expect(world.runs[0]?.slice(1)).toEqual(['add', CLEAN]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: CLEAN });
 });
 
 test('a fork answer that fails acceptance falls through to the small model', FORK, async ($, on) => {
@@ -511,7 +525,7 @@ test('a fork answer that fails acceptance falls through to the small model', FOR
     await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
     expect(world.forks).toHaveLength(1);
     expect(world.completions).toHaveLength(1);
-    expect(world.runs[0]?.slice(1)).toEqual(['add', CLEAN]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: CLEAN });
 });
 
 test('when the fork and the small model both fail the typed text is stored', FORK, async ($, on) => {
@@ -520,7 +534,7 @@ test('when the fork and the small model both fail the typed text is stored', FOR
     const result = await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
     expect(world.forks).toHaveLength(1);
     expect(world.completions).toHaveLength(1);
-    expect(world.runs[0]?.slice(1)).toEqual(['add', TYPED]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: TYPED });
     expect(result.text).toBe(`later: parked -> ${TYPED}`);
 });
 
@@ -537,7 +551,7 @@ test('a fork that outlasts 40 seconds is abandoned for the small model', FORK, a
     await world.clock.advance(1);
     const result = await run;
     expect(world.completions).toHaveLength(1);
-    expect(world.runs[0]?.slice(1)).toEqual(['add', CLEAN]);
+    expect(engineRuns(world)[0]).toEqual({ args: ['add'], stdin: CLEAN });
     expect(result.text).toBe(`later: parked -> ${CLEAN} (typed: ${TYPED})`);
     await world.clock.advance(1_000);
     expect(world.runs).toHaveLength(1);
@@ -592,8 +606,8 @@ function liveQueue(initial: ReadonlyArray<string>): {
             texts = [...next];
         },
         world: {
-            rows: () => rowsOf('shop', texts.map((text) => ['today', text] as const)),
-            closeNote: ([mode, , text, n]) => {
+            rows: () => rowsOf('shop', texts.map((text) => ['today', text] as const), QUEUE_PATH),
+            closeNote: ([mode, , n], text) => {
                 const index = Number(n) - 1;
                 if (texts[index] !== text) {
                     return {
@@ -656,7 +670,7 @@ for (const surface of SURFACES) {
             const ui = await openPane($, surface);
             await personFocus($, key(ASK));
             await ui.press({ key: 'done' });
-            expect(engineCalls(world)).toContainEqual(['done', '--if', ASK, '2']);
+            expect(engineRuns(world)).toContainEqual({ args: ['done', '--if', '2'], stdin: ASK });
             expect(await shows(ui, `later: done -> ${ASK}`)).toBe(true);
             expect(await shows(ui, 'shop: 2 parked')).toBe(true);
             expect((await ui.find({ key: key(RAISE) }))?.text).toStartWith('> 2. ');
@@ -667,7 +681,7 @@ for (const surface of SURFACES) {
             const world = stage(on, liveQueue([CHECK, ASK, RAISE]).world);
             const ui = await openPane($, surface);
             await ui.press({ key: 'drop' });
-            expect(engineCalls(world)).toContainEqual(['drop', '--if', CHECK, '1']);
+            expect(engineRuns(world)).toContainEqual({ args: ['drop', '--if', '1'], stdin: CHECK });
             expect(await shows(ui, `later: dropped -> ${CHECK}`)).toBe(true);
         });
 
@@ -678,11 +692,11 @@ for (const surface of SURFACES) {
             await personFocus($, key(RAISE));
             queue.set([ASK, RAISE]);
             await ui.press({ key: 'done' });
-            expect(engineCalls(world)).toContainEqual(['done', '--if', RAISE, '3']);
+            expect(engineRuns(world)).toContainEqual({ args: ['done', '--if', '3'], stdin: RAISE });
             expect(await shows(ui, 'later: note 3 changed since it was listed; nothing changed')).toBe(true);
             expect((await ui.find({ key: key(RAISE) }))?.text).toStartWith('> 2. ');
             await ui.press({ key: 'done' });
-            expect(engineCalls(world)).toContainEqual(['done', '--if', RAISE, '2']);
+            expect(engineRuns(world)).toContainEqual({ args: ['done', '--if', '2'], stdin: RAISE });
             expect(await shows(ui, `later: done -> ${RAISE}`)).toBe(true);
         });
 
@@ -728,7 +742,7 @@ for (const surface of SURFACES) {
             await ui.press({ key: 'next' });
             expect((await ui.find({ key: key(RAISE) }))?.text).toStartWith('> 3. ');
             await ui.press({ key: 'done' });
-            expect(engineCalls(world)).toContainEqual(['done', '--if', RAISE, '3']);
+            expect(engineRuns(world)).toContainEqual({ args: ['done', '--if', '3'], stdin: RAISE });
         });
 
         test('duplicate notes get distinct rows, and d acts on the one selected', async ($, on) => {
@@ -737,14 +751,15 @@ for (const surface of SURFACES) {
             expect(await buttonKeys(ui)).toEqual(expect.arrayContaining([key(RERUN, 1), key(RERUN, 2)]));
             await personFocus($, key(RERUN, 2));
             await ui.press({ key: 'done' });
-            expect(engineCalls(world)).toContainEqual(['done', '--if', RERUN, '2']);
+            expect(engineRuns(world)).toContainEqual({ args: ['done', '--if', '2'], stdin: RERUN });
         });
 
         test('a second d pressed while the first runs is ignored', async ($, on) => {
             const world = stage(on, liveQueue([RERUN, RERUN, RAISE]).world);
             const ui = await openPane($, surface);
             await Promise.all([ui.press({ key: 'done' }), ui.press({ key: 'done' })]);
-            expect(engineCalls(world).filter(([verb]) => verb === 'done')).toEqual([['done', '--if', RERUN, '1']]);
+            const closes = engineRuns(world).filter(({ args }) => args[0] === 'done');
+            expect(closes).toEqual([{ args: ['done', '--if', '1'], stdin: RERUN }]);
             expect(await shows(ui, 'shop: 2 parked')).toBe(true);
             expect((await ui.find({ key: key(RERUN) }))?.text).toStartWith(`> 1. ${RERUN}`);
         });
@@ -759,14 +774,14 @@ for (const surface of SURFACES) {
             expect((await ui.find({ key: key(RERUN) }))?.text).toStartWith(`> 1. ${RERUN}`);
             expect((await ui.find({ key: key(RAISE) }))?.text).toStartWith('  2. ');
             await ui.press({ key: 'done' });
-            expect(engineCalls(world)).toContainEqual(['done', '--if', RERUN, '1']);
+            expect(engineRuns(world)).toContainEqual({ args: ['done', '--if', '1'], stdin: RERUN });
         });
 
         test('d on the first of two twins selects the row now at its place', async ($, on) => {
             const world = stage(on, liveQueue([RERUN, RAISE, RERUN]).world);
             const ui = await openPane($, surface);
             await ui.press({ key: 'done' });
-            expect(engineCalls(world)).toContainEqual(['done', '--if', RERUN, '1']);
+            expect(engineRuns(world)).toContainEqual({ args: ['done', '--if', '1'], stdin: RERUN });
             expect((await ui.find({ key: key(RAISE) }))?.text).toStartWith('> 1. ');
         });
 
@@ -775,7 +790,7 @@ for (const surface of SURFACES) {
             const ui = await openPane($, surface);
             await personFocus($, key(RERUN, 2));
             await ui.press({ key: 'done' });
-            expect(engineCalls(world)).toContainEqual(['done', '--if', RERUN, '3']);
+            expect(engineRuns(world)).toContainEqual({ args: ['done', '--if', '3'], stdin: RERUN });
             expect((await ui.find({ key: key(RAISE) }))?.text).toStartWith('> 2. ');
         });
 
@@ -783,7 +798,7 @@ for (const surface of SURFACES) {
             const world = stage(on, { rows: () => rowsOf('shop', [['today', 'text ']]) });
             const ui = await openPane($, surface);
             await ui.press({ key: 'done' });
-            expect(engineCalls(world)).toContainEqual(['done', '--if', 'text ', '1']);
+            expect(engineRuns(world)).toContainEqual({ args: ['done', '--if', '1'], stdin: 'text ' });
         });
 
         test('a note holding a tab is drawn whole and sent whole', async ($, on) => {
@@ -792,7 +807,7 @@ for (const surface of SURFACES) {
             const ui = await openPane($, surface);
             expect((await ui.find({ key: key(split) }))?.text).toContain(split);
             await ui.press({ key: 'done' });
-            expect(engineCalls(world)).toContainEqual(['done', '--if', split, '1']);
+            expect(engineRuns(world)).toContainEqual({ args: ['done', '--if', '1'], stdin: split });
         });
     });
 }
@@ -810,7 +825,7 @@ for (const surface of SURFACES) {
             expect(await ui.find({ type: 'Input', key: 'new-note' })).toBeDefined();
             expect(await buttonKeys(ui)).toEqual([key(CHECK), key(ASK), key(RAISE)]);
             await ui.input({ key: 'new-note', text: TYPED });
-            expect(engineCalls(world)).toContainEqual(['add', CLEAN]);
+            expect(engineRuns(world)).toContainEqual({ args: ['add'], stdin: CLEAN });
             expect(await shows(ui, `later: parked -> ${CLEAN} (typed: ${TYPED})`)).toBe(true);
             expect(await ui.find({ type: 'Input' })).toBeUndefined();
             expect(await buttonKeys(ui)).toContain('add');
@@ -941,7 +956,7 @@ test("the pane's a parks with the queue file setting", SET_FILE, async ($, on) =
     const ui = await openPane($, 'terminal');
     await ui.press({ key: 'add' });
     await ui.input({ key: 'new-note', text: TYPED });
-    expect(engineCalls(world)).toContainEqual(['add', TYPED]);
+    expect(engineRuns(world)).toContainEqual({ args: ['add'], stdin: TYPED });
     expect(settingOfRuns(world)).toEqual(engineCalls(world).map(() => 'LATER.md'));
 });
 
@@ -959,4 +974,87 @@ test('a refused open lists with the queue file setting', SET_FILE, async ($, on)
     await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
     expect(engineCalls(world)).toEqual([['rows'], ['list']]);
     expect(settingOfRuns(world)).toEqual(['LATER.md', 'LATER.md']);
+});
+
+// The texts of spec 1.8's worked examples. Passed as arguments, Git for Windows' runtime would replace `@README.md`
+// with that file's contents and glob `*.md` and `(the)`.
+const AT_FILE = '@README.md *.md';
+const PARENS = 'fix (the) export';
+
+// `/later` parks AT_FILE, the pane's `a` parks PARENS, `d` closes AT_FILE and `x` drops PARENS.
+test('user text never travels in the argument vector', OFF, async ($, on) => {
+    const world = stage(on, liveQueue([]).world);
+    const ui = await openPane($, 'terminal');
+    await $.command.run({ command: 'later', args: AT_FILE, ...AT_PROMPT });
+    await ui.press({ key: 'add' });
+    await ui.input({ key: 'new-note', text: PARENS });
+    await ui.press({ key: 'done' });
+    await ui.press({ key: 'drop' });
+    const sent = world.runs.flatMap((argv, index) => (argv[1] === 'rows' ? [] : [{ argv, init: world.inits[index] }]));
+    const args = sent.map(({ argv }) => argv.slice(1));
+    expect(args).toEqual([['add'], ['add'], ['done', '--if', '1'], ['drop', '--if', '1']]);
+    const texts = [AT_FILE, PARENS, AT_FILE, PARENS];
+    for (const [index, { argv, init }] of sent.entries()) {
+        const text = texts[index] ?? '';
+        expect(argv.filter((arg) => arg.includes(text))).toEqual([]);
+        expect(init?.stdin).toBe(text);
+        expect(init?.env?.['LATER_INPUT']).toBe('stdin');
+    }
+});
+
+test('a close sends the note text exactly', async ($, on) => {
+    const world = stage(on, { rows: () => rowsOf('shop', [['today', 'ends here  ']], QUEUE_PATH) });
+    const ui = await openPane($, 'terminal');
+    await ui.press({ key: 'done' });
+    const index = world.runs.findIndex((argv) => argv[1] === 'done');
+    expect(world.runs[index]?.slice(1)).toEqual(['done', '--if', '1']);
+    expect(world.inits[index]?.stdin).toBe('ends here  ');
+});
+
+// A bare run whose pane is not placed reads `rows` and then lists.
+test('runs without user text carry no standard input', async ($, on) => {
+    const world = stage(on, { open: 'unplaced' });
+    await $.session.start(SESSION);
+    await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
+    expect(engineCalls(world)).toEqual([['rows'], ['list']]);
+    expect(world.inits.map((init) => init !== undefined && 'stdin' in init)).toEqual([false, false]);
+    expect(world.inits.map((init) => init?.env !== undefined && 'LATER_INPUT' in init.env)).toEqual([false, false]);
+});
+
+// Every queue the module stores, in the order it stores them.
+function storedQueues(on: On): unknown[] {
+    const queues: unknown[] = [];
+    on('state.set', (_$, e, next) => {
+        if (e.key === 'queue') {
+            queues.push(e.value);
+        }
+        return next(e);
+    });
+    return queues;
+}
+
+// Two bare runs, the first over a queue line that names the queue file, the second over one that does not.
+test('the rows header path is read', async ($, on) => {
+    const queues = storedQueues(on);
+    let rows = rowsOf('shop', ROWS_NOTES, '/home/u/shop/LATER.local.md');
+    stage(on, { rows: () => rows });
+    await $.session.start(SESSION);
+    await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
+    rows = rowsOf('shop', ROWS_NOTES);
+    await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
+    expect(queues).toEqual([
+        expect.objectContaining({ kind: 'read', label: 'shop', path: '/home/u/shop/LATER.local.md' }),
+        expect.objectContaining({ kind: 'read', label: 'shop', path: '' }),
+    ]);
+});
+
+// The engine turns a tab in the label into a space, but a folder's tab stays in the path.
+test('a tab in the queue path stays in the path', async ($, on) => {
+    const queues = storedQueues(on);
+    stage(on, { rows: () => rowsOf('tab name', ROWS_NOTES, '/home/u/tab\tname/LATER.local.md') });
+    await $.session.start(SESSION);
+    await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
+    expect(queues).toEqual([
+        expect.objectContaining({ kind: 'read', label: 'tab name', path: '/home/u/tab\tname/LATER.local.md' }),
+    ]);
 });

@@ -4,6 +4,7 @@ import type {
     Elements,
     EngineInterface,
     ModelForkResult,
+    ProcessRunInit,
     Register,
     RenderElement,
     RenderInput,
@@ -261,20 +262,37 @@ function reasonOf(stderr: string, fallback: string): string {
     return line.startsWith('later: ') ? line.slice('later: '.length) : line;
 }
 
+// How an engine run is started. The queue file setting goes in the environment, over the inherited one: the engine
+// resolves the queue by it and stores it for the terminal command. User text, `input` (the note of an `add`, the
+// guard text of a `done` or `drop`), goes on standard input with `LATER_INPUT=stdin`, never as an argument, on every
+// platform (spec 1.8): Git for Windows' runtime rewrites the arguments a Windows program passes to bash, replacing
+// `@README.md` with that file's contents and globbing words such as `*.md` or `(the)`. A run without user text
+// gets neither.
+function engineInit(queueFile: string, input: string | undefined): ProcessRunInit {
+    if (input === undefined) {
+        return { timeoutMs: ENGINE_TIMEOUT_MS, env: { CLAUDE_PLUGIN_OPTION_FILE: queueFile } };
+    }
+    return {
+        timeoutMs: ENGINE_TIMEOUT_MS,
+        env: { CLAUDE_PLUGIN_OPTION_FILE: queueFile, LATER_INPUT: 'stdin' },
+        stdin: input,
+    };
+}
+
 // Runs the engine by argument vector, no shell, in the session's working directory, so the queue resolves as it
-// does from a terminal. The queue file setting goes in the environment, over the inherited one: the engine resolves
-// the queue by it and stores it for the terminal command. A non-zero exit and a rejection (cannot start, timeout)
-// both become a reason. The standard output comes back exactly as the engine printed it.
+// does from a terminal, started as engineInit says. A non-zero exit and a rejection (cannot start, timeout) both
+// become a reason. The standard output comes back exactly as the engine printed it.
 async function runEngineRaw(
     $: EngineInterface,
     queueFile: string,
     args: ReadonlyArray<string>,
+    input?: string,
 ): Promise<EngineOutcome> {
     try {
-        const result = await $.process.run([`${$.plugin.root}/scripts/later.sh`, ...args], {
-            timeoutMs: ENGINE_TIMEOUT_MS,
-            env: { CLAUDE_PLUGIN_OPTION_FILE: queueFile },
-        });
+        const result = await $.process.run(
+            [`${$.plugin.root}/scripts/later.sh`, ...args],
+            engineInit(queueFile, input),
+        );
         if (result.exitCode === 0) {
             return { ok: true, stdout: result.stdout };
         }
@@ -285,8 +303,13 @@ async function runEngineRaw(
 }
 
 // As runEngineRaw, with trailing whitespace trimmed from the standard output, for output shown as a line.
-async function runEngine($: EngineInterface, queueFile: string, args: ReadonlyArray<string>): Promise<EngineOutcome> {
-    const outcome = await runEngineRaw($, queueFile, args);
+async function runEngine(
+    $: EngineInterface,
+    queueFile: string,
+    args: ReadonlyArray<string>,
+    input?: string,
+): Promise<EngineOutcome> {
+    const outcome = await runEngineRaw($, queueFile, args, input);
     return outcome.ok ? { ok: true, stdout: outcome.stdout.trimEnd() } : outcome;
 }
 
@@ -296,13 +319,15 @@ function noteKey(text: string, occurrence: number): string {
     return `note:${occurrence}:${text}`;
 }
 
-// The output of `later.sh rows`: a `queue\t<label>` line, then one note line per open note. A line that is not a
-// note line is skipped.
+// The output of `later.sh rows`: a `queue\t<label>\t<path>` line, then one note line per open note. The engine
+// turns a tab in the label into a space, so the label is the second field and the path is the rest, its own tabs
+// kept; a queue line without a path gives ''. A line that is not a note line is skipped.
 function parseRows(stdout: string): Queue {
     const [head = '', ...lines] = stdout.split('\n');
     if (!head.startsWith('queue\t')) {
         return { kind: 'failed', reason: 'the engine printed no queue line' };
     }
+    const [, label = '', ...pathFields] = head.split('\t');
     const notes = lines.flatMap((line): ReadonlyArray<Omit<NoteRow, 'key'>> => {
         const match = NOTE_LINE.exec(line);
         if (match === null) {
@@ -319,7 +344,7 @@ function parseRows(stdout: string): Queue {
             text: note.text,
         }),
     );
-    return { kind: 'read', label: head.slice('queue\t'.length), rows };
+    return { kind: 'read', label, path: pathFields.join('\t'), rows };
 }
 
 // The notes a queue holds; one that could not be read holds none.
@@ -373,12 +398,12 @@ async function readQueue($: EngineInterface, queueFile: string): Promise<Queue> 
     return parseRows(listed.stdout.endsWith('\n') ? listed.stdout.slice(0, -1) : listed.stdout);
 }
 
-// Parks a typed note: the rewrite, then `add`. The line is what the command prints: the engine's line, followed by
-// ` (typed: <typed>)` when the rewrite changed the text, or the failure template, which keeps the typed text on
-// screen. The pane's add shows the same line.
+// Parks a typed note: the rewrite, then `add`, the note on standard input. The line is what the command prints: the
+// engine's line, followed by ` (typed: <typed>)` when the rewrite changed the text, or the failure template, which
+// keeps the typed text on screen. The pane's add shows the same line.
 async function park($: EngineInterface, mode: RewriteMode, queueFile: string, typed: string): Promise<Parked> {
     const stored = await rewrite($, mode, typed);
-    const added = await runEngine($, queueFile, ['add', stored]);
+    const added = await runEngine($, queueFile, ['add'], stored);
     if (!added.ok) {
         return { ok: false, line: `later: could not park the note (${added.reason}); typed: ${typed}` };
     }
@@ -564,15 +589,16 @@ async function workOnSelected($: EngineInterface, session: PaneSession): Promise
 }
 
 // `d` and `x`: closes the selected note, guarded by the text and number the pane drew, so a queue that changed
-// since the read is refused instead of losing another note. The text goes exactly as the read parsed it: a trimmed
-// copy would not match a note that ends in whitespace. The queue is read again either way, after a close with the
-// closed note named, so the selection moves on to the row now at its place even when a twin of it is still listed.
+// since the read is refused instead of losing another note. The text goes on standard input exactly as the read
+// parsed it: a trimmed copy would not match a note that ends in whitespace. The queue is read again either way,
+// after a close with the closed note named, so the selection moves on to the row now at its place even when a twin
+// of it is still listed.
 async function closeSelected($: EngineInterface, session: PaneSession, mode: 'done' | 'drop'): Promise<void> {
     const row = await selectedRow($);
     if (row === undefined) {
         return;
     }
-    const closed = await runEngine($, session.queueFile, [mode, '--if', row.text, String(row.position)]);
+    const closed = await runEngine($, session.queueFile, [mode, '--if', String(row.position)], row.text);
     const line = closed.ok ? closed.stdout : `later: ${closed.reason}`;
     await update($, statusState, () => line);
     await refresh($, session, closed.ok ? row.key : undefined);
