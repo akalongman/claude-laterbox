@@ -302,8 +302,9 @@ Both model calls go through Claude Code's own model access. Beyond them,
 what the plugin adds to the conversation goes to the model with the rest of
 the session: the output row of `/later` with its hidden note, the tool
 `queue`'s description, which Claude Code offers to the model in every
-session, and the tool's results. The plugin opens no network connection of
-its own; the engine and the terminal command make no network access.
+session that does not deny it, and the tool's results. The plugin opens no
+network connection of its own; the engine and the terminal command make no
+network access.
 
 ### What it writes
 
