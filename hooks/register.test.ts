@@ -48,8 +48,13 @@ type World = {
     readonly env?: Readonly<Record<string, string>>; // the variables `$.env.get` reads
     readonly isEnvRefused?: (name: string) => boolean; // which `$.env.get` reads are refused
     readonly files?: ReadonlyArray<string>; // the paths `$.fs.exists` finds
-    readonly exists?: (path: string) => Promise<boolean>; // answers `$.fs.exists` in place of files
+    readonly exists?: (path: string) => Promise<boolean | 'deny'>; // answers `$.fs.exists` in place of files
+    readonly stat?: (path: string) => FileTimes | 'deny'; // answers `$.fs.stat`; 'deny' refuses it
+    readonly cwd?: () => string; // the folder `$.session.cwd()` answers
 };
+
+// What `$.fs.stat` answers for a file, beside its kind.
+type FileTimes = { readonly mtimeMs: number; readonly size: number };
 
 type Stage = {
     readonly clock: MockClock;
@@ -65,6 +70,7 @@ type Stage = {
     readonly fills: { readonly text: string; readonly mode: string }[];
     readonly fileChecks: string[];
     readonly debugLines: string[];
+    readonly sequence: string[]; // every `$.session.cwd`, `$.fs.exists`, `$.fs.stat` and `$.process.run`, in order
 };
 
 const PANE_ID = 'later-notes';
@@ -135,7 +141,8 @@ function drivePathOf(path: string): string {
 // tests raise has a bottom. Defaults: the registration succeeds, the engine answers as engineReply does (ROWS for
 // `rows`, LISTING for `list`, and it parks or closes by whatever text arrives on standard input), the transcript is
 // empty, the completion answers CLEAN, the fork has nothing to fork, the pane is placed, no pane is open, the draft
-// is empty, a fill succeeds, no variable is set and no file exists.
+// is empty, a fill succeeds, no variable is set, no file exists (a stat is refused) and the session runs in
+// SESSION.cwd.
 function stage(on: On, world: World = {}): Stage {
     const clock = mock.clock(on);
     const recorded: Stage = {
@@ -152,6 +159,7 @@ function stage(on: On, world: World = {}): Stage {
         fills: [],
         fileChecks: [],
         debugLines: [],
+        sequence: [],
     };
     const { env = {}, isEnvRefused } = world;
     if (isEnvRefused === undefined) {
@@ -178,6 +186,7 @@ function stage(on: On, world: World = {}): Stage {
         return { value: undefined };
     });
     on('process.run', (_$, e) => {
+        recorded.sequence.push(`process.run ${e.argv.slice(1).join(' ')}`);
         recorded.runs.push([...e.argv]);
         recorded.inits.push(e.init);
         const { engine } = world;
@@ -239,11 +248,21 @@ function stage(on: On, world: World = {}): Stage {
     });
     on('fs.exists', async (_$, e) => {
         const path = drivePathOf(e.path);
+        recorded.sequence.push('fs.exists');
         recorded.fileChecks.push(path);
-        if (world.exists !== undefined) {
-            return { value: await world.exists(path) };
-        }
-        return { value: (world.files ?? []).includes(path) };
+        const found = world.exists === undefined ? (world.files ?? []).includes(path) : await world.exists(path);
+        return found === 'deny' ? { deny: 'a network location' } : { value: found };
+    });
+    on('fs.stat', (_$, e) => {
+        recorded.sequence.push('fs.stat');
+        const times = world.stat?.(drivePathOf(e.path)) ?? 'deny';
+        return times === 'deny'
+            ? { deny: 'refused by the test' }
+            : { value: { kind: 'file', size: times.size, mtimeMs: times.mtimeMs, isLink: false } };
+    });
+    on('session.cwd', () => {
+        recorded.sequence.push('session.cwd');
+        return { value: world.cwd?.() ?? SESSION.cwd };
     });
     return recorded;
 }
@@ -656,19 +675,25 @@ async function buttonKeys(ui: PaneUi): Promise<string[]> {
     return (await ui.findAll({ type: 'Button' })).map((button) => button.key ?? '');
 }
 
-// A queue the stubbed engine reads, closes notes in (checking --if as later.sh does) and parks notes into.
+// A queue the stubbed engine reads, closes notes in (checking --if as later.sh does) and parks notes into. Its file is
+// at QUEUE_PATH, and every change gives it a new modification time, as a write does.
 function liveQueue(initial: ReadonlyArray<string>): {
     readonly world: World;
     readonly set: (texts: ReadonlyArray<string>) => void;
 } {
     let texts = [...initial];
+    let writes = 0;
     const ok = (stdout: string): EngineReply => ({ exitCode: 0, stdout, stderr: '' });
+    const write = (next: ReadonlyArray<string>): void => {
+        texts = [...next];
+        writes += 1;
+    };
     return {
-        set: (next) => {
-            texts = [...next];
-        },
+        set: write,
         world: {
             rows: () => rowsOf('shop', texts.map((text) => ['today', text] as const), QUEUE_PATH),
+            exists: async (path) => path === QUEUE_PATH,
+            stat: (path) => (path === QUEUE_PATH ? { mtimeMs: 1_000 + writes, size: texts.join('\n').length } : 'deny'),
             closeNote: ([mode, , n], text) => {
                 const index = Number(n) - 1;
                 if (texts[index] !== text) {
@@ -678,11 +703,11 @@ function liveQueue(initial: ReadonlyArray<string>): {
                         stderr: `later: note ${n} changed since it was listed; nothing changed\n`,
                     };
                 }
-                texts = texts.filter((_, at) => at !== index);
+                write(texts.filter((_, at) => at !== index));
                 return ok(`later: ${mode === 'done' ? 'done' : 'dropped'} -> ${text}\n`);
             },
             add: (note) => {
-                texts = [...texts, note];
+                write([...texts, note]);
                 return ok(`later: parked -> ${note}\n`);
             },
         },
@@ -926,7 +951,8 @@ for (const surface of SURFACES) {
     });
 }
 
-test('the open pane reads the queue every five seconds', async ($, on) => {
+// The first tick reads once more, since the open's read had no file to look at; the second reads the changed queue.
+test('the open pane looks every five seconds and shows a changed queue', async ($, on) => {
     const queue = liveQueue([CHECK]);
     const world = stage(on, queue.world);
     const ui = await openPane($, 'terminal');
@@ -989,6 +1015,155 @@ test('a session that is not interactive reads nothing on the clock', async ($, o
     await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
     await world.clock.advance(10_000);
     expect(rowsReads(world)).toBe(0);
+});
+
+// The modification time and size of a queue file that does not change.
+const STEADY: FileTimes = { mtimeMs: 1_000, size: 160 };
+
+// A queue file at QUEUE_PATH that the look finds, standing as `times` says at each look.
+function queueFile(times: () => FileTimes): Pick<World, 'exists' | 'stat'> {
+    return {
+        exists: async (path) => path === QUEUE_PATH,
+        stat: (path) => (path === QUEUE_PATH ? times() : 'deny'),
+    };
+}
+
+// The open's read had no file to look at, so the first tick, at 5 seconds, reads once more and takes the look; the
+// ticks after it read nothing until a minute after that read.
+test('an open pane on an unchanged queue reads only at the minute', async ($, on) => {
+    const world = stage(on, queueFile(() => STEADY));
+    await openPane($, 'terminal');
+    expect(rowsReads(world)).toBe(1);
+    await world.clock.set(5_000);
+    expect(rowsReads(world)).toBe(2);
+    for (let at = 10_000; at <= 60_000; at += 5_000) {
+        await world.clock.set(at);
+        expect(rowsReads(world)).toBe(2);
+    }
+    await world.clock.set(65_000);
+    expect(rowsReads(world)).toBe(3);
+});
+
+test('a changed modification time is read on the next tick', async ($, on) => {
+    let mtimeMs = STEADY.mtimeMs;
+    const world = stage(on, queueFile(() => ({ ...STEADY, mtimeMs })));
+    await openPane($, 'terminal');
+    await world.clock.set(10_000);
+    expect(rowsReads(world)).toBe(2);
+    mtimeMs += 1;
+    await world.clock.set(15_000);
+    expect(rowsReads(world)).toBe(3);
+});
+
+// The engine lists a queue whose file is gone as an empty one, its path still on the queue line.
+test('a deleted queue file is read on the next tick and shows an empty queue', async ($, on) => {
+    let isThere = true;
+    const world = stage(on, {
+        rows: () => rowsOf('shop', isThere ? ROWS_NOTES : [], QUEUE_PATH),
+        exists: async (path) => isThere && path === QUEUE_PATH,
+        stat: (path) => (isThere && path === QUEUE_PATH ? STEADY : 'deny'),
+    });
+    const ui = await openPane($, 'terminal');
+    await world.clock.set(10_000);
+    expect(rowsReads(world)).toBe(2);
+    isThere = false;
+    await world.clock.set(15_000);
+    expect(rowsReads(world)).toBe(3);
+    expect(await shows(ui, 'shop: no parked notes')).toBe(true);
+    expect(await ui.findAll({ type: 'Text', text: /^later: / })).toEqual([]);
+    await world.clock.set(20_000);
+    expect(rowsReads(world)).toBe(3);
+});
+
+const BILLING = '/home/u/projects/org/billing';
+
+// The file in the other folder looks the same as the first: the folder alone sends the tick to the engine. That read
+// names another file than the one looked at, so the tick after it reads once more to take a look at the new one.
+test('a session that moved to another folder is read on the next tick', async ($, on) => {
+    let cwd: string = SESSION.cwd;
+    const world = stage(on, {
+        cwd: () => cwd,
+        rows: () => (cwd === BILLING ? rowsOf('billing', [['today', RERUN]], `${BILLING}/LATER.local.md`) : ROWS),
+        exists: async () => true,
+        stat: () => STEADY,
+    });
+    const ui = await openPane($, 'terminal');
+    await world.clock.set(10_000);
+    expect(rowsReads(world)).toBe(2);
+    cwd = BILLING;
+    await world.clock.set(15_000);
+    expect(rowsReads(world)).toBe(3);
+    expect(await shows(ui, 'billing: 1 parked')).toBe(true);
+    await world.clock.set(20_000);
+    expect(rowsReads(world)).toBe(4);
+    await world.clock.set(25_000);
+    expect(rowsReads(world)).toBe(4);
+});
+
+// A network location, whose `exists` the module's file layer rejects, and a file whose stat is refused (spec 2.3).
+const UNSEEN: ReadonlyArray<readonly [string, Pick<World, 'exists' | 'stat'>]> = [
+    ['fs.exists', { exists: async () => 'deny' }],
+    ['fs.stat', { exists: async () => true, stat: () => 'deny' }],
+];
+for (const [refused, files] of UNSEEN) {
+    test(`a queue that cannot be seen is read on every tick (${refused} refused)`, async ($, on) => {
+        const world = stage(on, files);
+        await openPane($, 'terminal');
+        for (const [at, reads] of [[5_000, 2], [10_000, 3], [15_000, 4]] as const) {
+            await world.clock.set(at);
+            expect(rowsReads(world)).toBe(reads);
+        }
+    });
+}
+
+// The open has no file to look at yet; the first tick and the read after a `d` take the folder and look at the file
+// before they run `rows`, and the `d` compares the folder before it runs `done`.
+test('the look comes before the read', async ($, on) => {
+    const world = stage(on, queueFile(() => STEADY));
+    const ui = await openPane($, 'terminal');
+    expect(world.sequence).toEqual(['session.cwd', 'process.run rows']);
+    await world.clock.set(5_000);
+    expect(world.sequence.slice(2)).toEqual(['session.cwd', 'fs.exists', 'fs.stat', 'process.run rows']);
+    await ui.press({ key: 'done' });
+    expect(world.sequence.slice(6)).toEqual([
+        'session.cwd',
+        'process.run done --if 1',
+        'session.cwd',
+        'fs.exists',
+        'fs.stat',
+        'process.run rows',
+    ]);
+});
+
+const MOVED = 'later: the session moved to another folder; the list was read again';
+
+// The first `d` reads the list of the folder the session is in now and closes nothing; the second acts on that list.
+test('d after the session moved reads again and closes nothing', async ($, on) => {
+    let cwd: string = SESSION.cwd;
+    const world = stage(on, {
+        cwd: () => cwd,
+        rows: () => (cwd === BILLING ? rowsOf('billing', [['today', RERUN]], `${BILLING}/LATER.local.md`) : ROWS),
+    });
+    const ui = await openPane($, 'terminal');
+    cwd = BILLING;
+    await ui.press({ key: 'done' });
+    expect(engineCalls(world)).toEqual([['rows'], ['rows']]);
+    expect(await shows(ui, MOVED)).toBe(true);
+    expect(await shows(ui, 'billing: 1 parked')).toBe(true);
+    await ui.press({ key: 'done' });
+    expect(engineRuns(world).slice(2)).toEqual([{ args: ['done', '--if', '1'], stdin: RERUN }, { args: ['rows'] }]);
+});
+
+test('w after the session moved reads again and fills nothing', async ($, on) => {
+    let cwd: string = SESSION.cwd;
+    const world = stage(on, { cwd: () => cwd });
+    const ui = await openPane($, 'terminal');
+    cwd = BILLING;
+    await ui.press({ key: 'work' });
+    expect(world.fills).toEqual([]);
+    expect(world.closes).toEqual([]);
+    expect(engineCalls(world)).toEqual([['rows'], ['rows']]);
+    expect(await shows(ui, MOVED)).toBe(true);
 });
 
 // The queue file set to `LATER.md` in `/config`.

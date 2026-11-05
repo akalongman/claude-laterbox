@@ -18,6 +18,8 @@ import type { BashVariables } from './bash';
 import { findBash, isWindowsHost, scriptPathOf } from './bash';
 import type { RunFailure } from './failure';
 import { failureKindOf, failureReason } from './failure';
+import type { FileLook, GateMemo } from './gate';
+import { needsRead } from './gate';
 
 // The three ways a typed note is cleaned before it is stored: the `/config` row `laterbox.rewrite`.
 type RewriteMode = 'haiku' | 'fork' | 'off';
@@ -47,7 +49,8 @@ type Parked =
 // What the module knows of this session, in one object `register` creates: the queue file setting and the launcher
 // every engine run is given (an EngineContext), whether the session is interactive (only then does a bare run open
 // the pane), whether the pane is open, whether an action on a note is running, how many reads of the queue are in
-// flight and how many have started, and the refresh timer (C1).
+// flight and how many have started, the refresh timer (C1), and the memo of the read the pane shows (spec R2),
+// undefined until the pane has read.
 type PaneSession = {
     readonly queueFile: string;
     launcher: Promise<Launcher>;
@@ -57,6 +60,16 @@ type PaneSession = {
     readsInFlight: number;
     readsStarted: number;
     refreshTimer: Timer;
+    gate: GateMemo | undefined;
+};
+
+// What the pane saw just before a read of the queue (spec 2.2): the session's working directory, the path the memo
+// named ('' while no read named one), the look at that file (undefined with no path), and the time.
+type QueueLook = {
+    readonly cwd: string;
+    readonly path: string;
+    readonly file: FileLook | undefined;
+    readonly nowMs: number;
 };
 
 const COMMAND_DESCRIPTION =
@@ -65,8 +78,11 @@ const COMMAND_DESCRIPTION =
 // The notes pane, one per session, drawn from the four values below.
 const PANE = 'later-notes';
 
-// How often the open pane reads the queue again (C1).
+// How often the open pane looks at the queue, and reads it when the gate says so (C1, spec R2).
 const REFRESH_MS = 5_000;
+
+// The status line of an action on a note refused because the session left the folder the list was read in (spec 2.4).
+const MOVED_LINE = 'later: the session moved to another folder; the list was read again';
 
 // The refresh timer until a session start replaces it: stopping it does nothing.
 const NO_TIMER: Timer = { cancel: () => undefined };
@@ -513,6 +529,39 @@ async function readQueue($: EngineInterface, context: EngineContext): Promise<Qu
     return parseRows(listed.stdout.endsWith('\n') ? listed.stdout.slice(0, -1) : listed.stdout);
 }
 
+// A look at the queue file, which starts no process (spec 2.2, 2.3): `exists` first, then `stat` when it exists. An
+// `exists` that rejects (a network location, which the file layer never touches) or a `stat` that rejects for a file
+// that exists (an access refusal) leaves the file unseeable, and the pane reads on every tick.
+async function lookAt($: EngineInterface, path: string): Promise<FileLook> {
+    const exists = await $.fs.exists(path).catch((): undefined => undefined);
+    if (exists === undefined) {
+        return { kind: 'unseeable' };
+    }
+    if (!exists) {
+        return { kind: 'absent' };
+    }
+    const stat = await $.fs.stat(path).catch((): undefined => undefined);
+    return stat === undefined ? { kind: 'unseeable' } : { kind: 'present', mtimeMs: stat.mtimeMs, size: stat.size };
+}
+
+// The look a read is gated on and remembered by, taken before the read so a write landing between the two costs one
+// more read instead of hiding until the minute (spec 2.2). The file looked at is the one `memo` names; a memo that
+// names none, or no memo, gives no look, and '' never reaches the file layer.
+async function lookBeforeRead($: EngineInterface, memo: GateMemo | undefined): Promise<QueueLook> {
+    const cwd = await $.session.cwd();
+    const path = memo?.path ?? '';
+    const file = path === '' ? undefined : await lookAt($, path);
+    return { cwd, path, file, nowMs: await $.clock.now() };
+}
+
+// The memo a read leaves: the folder and time of the look before it, the path the read named (the one looked at
+// when the read failed), and the look only when it was taken at that path. A read that names another file (the
+// first read, or one after a `cd`) leaves no look, so the next tick reads once more and takes one.
+function memoAfterRead(look: QueueLook, queue: Queue): GateMemo {
+    const path = queue.kind === 'read' ? queue.path : look.path;
+    return { cwd: look.cwd, path, file: path === look.path ? look.file : undefined, readAtMs: look.nowMs };
+}
+
 // Parks a typed note: the rewrite, then `add`, the note on standard input. The line is what the command prints: the
 // engine's line, followed by ` (typed: <typed>)` when the rewrite changed the text, or the failure template, which
 // keeps the typed text on screen. The pane's add shows the same line.
@@ -547,16 +596,19 @@ async function inFlight<T>(session: PaneSession, work: (isOvertaken: () => boole
 }
 
 // Reads the queue into state and opens the pane over it. Opened afresh, the pane selects the first note; opened
-// while open, it keeps the selection as a re-read does. An open another plugin refuses prints the list. So does one
-// that waits undrawn because no attached surface places panes, after closing it again: seated later, it would show
-// a queue nobody asked for at that moment.
+// while open, it keeps the selection as a re-read does. The read is looked at before and remembered as a refresh's
+// is, so the timer and the pane's actions judge against it. An open another plugin refuses prints the list. So does
+// one that waits undrawn because no attached surface places panes, after closing it again: seated later, it would
+// show a queue nobody asked for at that moment.
 async function openPane($: EngineInterface, session: PaneSession): Promise<CommandRunResult> {
     const queue = await inFlight(session, async () => {
+        const look = await lookBeforeRead($, session.gate);
         const listed = await readQueue($, session);
         const selected = session.isPaneOpen
             ? reselect(await read($, queueState), listed, await read($, selectedState))
             : firstSelection(listed);
         await update($, queueState, () => listed);
+        session.gate = memoAfterRead(look, listed);
         await update($, selectedState, () => selected);
         await update($, addingState, () => false);
         await update($, statusState, () => '');
@@ -589,15 +641,21 @@ async function ringToRow($: EngineInterface, key: string): Promise<void> {
 }
 
 // Reads the queue again. When it changed, stores it and moves the selection by the rule of a re-read; a selection
-// that moved to another note takes the ring with it (C3) unless an input holds it. A read overtaken by one that
-// started after it writes nothing: a tick that read before a `d` would otherwise put the closed note back. The check
-// runs once, before the two writes; a read that started and settled between them would still be written over, which
-// takes an engine run faster than a state write. `closedKey` names the note a `d` or `x` of the pane just closed.
-async function refresh($: EngineInterface, session: PaneSession, closedKey?: string): Promise<void> {
+// that moved to another note takes the ring with it (C3) unless an input holds it. The memo is written with the
+// queue it describes, or alone when the queue is unchanged, from the look taken before the read: the tick's `look`,
+// else one taken here. A read overtaken by one that started after it writes nothing, its memo included: a tick that
+// read before a `d` would otherwise put the closed note back. The check runs once, before the writes; a read that
+// started and settled between them would still be written over, which takes an engine run faster than a state
+// write. `closedKey` names the note a `d` or `x` of the pane just closed.
+async function refresh($: EngineInterface, session: PaneSession, closedKey?: string, look?: QueueLook): Promise<void> {
     await inFlight(session, async (isOvertaken) => {
+        const seen = look ?? (await lookBeforeRead($, session.gate));
         const queue = await readQueue($, session);
         const before = await read($, queueState);
         if (JSON.stringify(queue) === JSON.stringify(before)) {
+            if (!isOvertaken()) {
+                session.gate = memoAfterRead(seen, queue);
+            }
             return;
         }
         const selected = await read($, selectedState);
@@ -606,6 +664,7 @@ async function refresh($: EngineInterface, session: PaneSession, closedKey?: str
         }
         const reselected = reselect(before, queue, selected, closedKey);
         await update($, queueState, () => queue);
+        session.gate = memoAfterRead(seen, queue);
         await update($, selectedState, () => reselected);
         if (reselected.kind === 'note' && (selected.kind === 'none' || selected.key !== reselected.key)) {
             await ringToRow($, reselected.key);
@@ -613,15 +672,24 @@ async function refresh($: EngineInterface, session: PaneSession, closedKey?: str
     });
 }
 
-// One period of the refresh timer (C1). It reads only while the pane is open and no read is in flight, so a slow
-// engine never stacks reads. Nothing awaits a tick, so a failure goes to the debug log and the next period reads
-// again. An engine failure never gets here: it becomes the pane's header.
+// One period of the refresh timer (C1). It takes the session's folder and looks at the queue file, which starts no
+// process, and runs `rows` only when the gate says the queue may have changed (spec 2.2). It reads only while the
+// pane is open and no read is in flight, so a slow engine never stacks reads; both are checked again after the look,
+// which a close or another read can overtake, and the read then starts in the same step as the check. The look is
+// judged against the memo it was taken for: a read that settled meanwhile left a newer one, whose list is at least
+// as fresh. Nothing awaits a tick, so a failure goes to the debug log and the next period tries again. An engine
+// failure never gets here: it becomes the pane's header.
 async function tick($: EngineInterface, session: PaneSession): Promise<void> {
     if (!session.isPaneOpen || session.readsInFlight > 0) {
         return;
     }
     try {
-        await refresh($, session);
+        const memo = session.gate;
+        const look = await lookBeforeRead($, memo);
+        if (!session.isPaneOpen || session.readsInFlight > 0 || !needsRead(memo, look.cwd, look.file, look.nowMs)) {
+            return;
+        }
+        await refresh($, session, undefined, look);
     } catch (error: unknown) {
         debugLog($, `later: the pane could not read the queue: ${messageOf(error)}`);
     }
@@ -668,9 +736,24 @@ async function appendToDraft($: EngineInterface, text: string): Promise<Filled> 
     }
 }
 
-// `w`, or Enter on a row: the note goes into the prompt box and the pane closes. A box that does not take it keeps
-// the pane open, and the status line says why.
+// Before an action on a note (spec 2.4): when the session's working directory is not the one the list on screen was
+// read in, the list is read again, the status line says so, and the action is not taken, so a list of one project
+// never acts on another. A pane with no memo has no folder to compare, which counts as moved.
+async function readAgainIfMoved($: EngineInterface, session: PaneSession): Promise<boolean> {
+    if ((await $.session.cwd()) === session.gate?.cwd) {
+        return false;
+    }
+    await refresh($, session);
+    await update($, statusState, () => MOVED_LINE);
+    return true;
+}
+
+// `w`, or Enter on a row: the note goes into the prompt box and the pane closes, unless the session moved to another
+// folder. A box that does not take it keeps the pane open, and the status line says why.
 async function workOnNote($: EngineInterface, session: PaneSession, row: NoteRow): Promise<void> {
+    if (await readAgainIfMoved($, session)) {
+        return;
+    }
     const filled = await appendToDraft($, row.text);
     if (filled.ok) {
         await closePane($, session);
@@ -704,11 +787,14 @@ async function workOnSelected($: EngineInterface, session: PaneSession): Promise
 }
 
 // `d` and `x`: closes the selected note, guarded by the text and number the pane drew, so a queue that changed
-// since the read is refused instead of losing another note. The text goes on standard input exactly as the read
-// parsed it: a trimmed copy would not match a note that ends in whitespace. The queue is read again either way,
-// after a close with the closed note named, so the selection moves on to the row now at its place even when a twin
-// of it is still listed.
+// since the read is refused instead of losing another note; a session that moved to another folder closes nothing.
+// The text goes on standard input exactly as the read parsed it: a trimmed copy would not match a note that ends in
+// whitespace. The queue is read again either way, after a close with the closed note named, so the selection moves
+// on to the row now at its place even when a twin of it is still listed.
 async function closeSelected($: EngineInterface, session: PaneSession, mode: 'done' | 'drop'): Promise<void> {
+    if (await readAgainIfMoved($, session)) {
+        return;
+    }
     const row = await selectedRow($);
     if (row === undefined) {
         return;
@@ -898,6 +984,7 @@ export const register: Register = (on, options) => {
         readsInFlight: 0,
         readsStarted: 0,
         refreshTimer: NO_TIMER,
+        gate: undefined,
     };
 
     // The name is taken while a user-level skill or command named `later` exists; the toast says so and the rest of
