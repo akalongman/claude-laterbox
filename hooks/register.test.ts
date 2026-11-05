@@ -45,7 +45,8 @@ type World = {
     readonly draft?: string;
     readonly draftRead?: 'deny'; // refuses `$.prompt.read`
     readonly fill?: PromptFillResult;
-    readonly env?: Readonly<Record<string, string>> | 'deny'; // the variables `$.env.get` reads, or a refusal
+    readonly env?: Readonly<Record<string, string>>; // the variables `$.env.get` reads
+    readonly isEnvRefused?: (name: string) => boolean; // which `$.env.get` reads are refused
     readonly files?: ReadonlyArray<string>; // the paths `$.fs.exists` finds
     readonly exists?: (path: string) => Promise<boolean>; // answers `$.fs.exists` in place of files
 };
@@ -150,10 +151,11 @@ function stage(on: On, world: World = {}): Stage {
         fills: [],
         fileChecks: [],
     };
-    if (world.env === 'deny') {
-        on('env.get', () => ({ deny: 'refused by the test' }));
+    const { env = {}, isEnvRefused } = world;
+    if (isEnvRefused === undefined) {
+        mock.env(on, env);
     } else {
-        mock.env(on, world.env ?? {});
+        on('env.get', (_$, e) => (isEnvRefused(e.name) ? { deny: 'refused by the test' } : { value: env[e.name] }));
     }
     on('session.start', (_$, e) => ({ cwd: e.cwd }));
     on('command.register', (_$, e) => {
@@ -1137,14 +1139,27 @@ test('no bash: one toast and a plain reason everywhere', OFF, async ($, on) => {
     expect(world.runs).toEqual([]);
 });
 
-test('a search that fails counts as no bash found', OFF, async ($, on) => {
-    const world = stage(on, { env: 'deny' });
+// Every read refused, `OS` among them: the host is not taken as Windows, so the engine runs as before (spec 1.1, R6).
+test('refused variable reads leave the engine running directly', OFF, async ($, on) => {
+    const world = stage(on, { isEnvRefused: () => true });
     await $.session.start(HEADLESS);
     const parked = await $.command.run({ command: 'later', args: 'x', ...AT_PROMPT });
-    expect(parked).toEqual({ text: `later: could not park the note (${NO_BASH_REASON}); typed: x` });
+    expect(parked.text).toBe('later: parked -> x');
+    expect(world.runs).toHaveLength(1);
+    expect(world.runs[0]?.[0]).toEndWith('/scripts/later.sh');
     await world.clock.settle();
-    expect(world.toasts).toEqual([NO_BASH_LINE]);
-    expect(world.runs).toEqual([]);
+    expect(world.toasts).toEqual([]);
+});
+
+// On Windows a refused read skips only its own step: without PATH the search still takes SHELL.
+test('on Windows a refused PATH read still finds the bash in SHELL', OFF, async ($, on) => {
+    const world = stage(on, { env: WINDOWS, files: [GIT_BASH], isEnvRefused: (name) => name === 'PATH' });
+    await $.session.start(SESSION);
+    await $.command.run({ command: 'later', args: 'x', ...AT_PROMPT });
+    expect(world.runs).toHaveLength(1);
+    expect(world.runs[0]?.[0]).toBe(GIT_BASH);
+    await world.clock.settle();
+    expect(world.toasts).toEqual([]);
 });
 
 // An answer the test holds until it releases it.

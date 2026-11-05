@@ -301,17 +301,19 @@ function engineInit(queueFile: string, input: string | undefined): ProcessRunIni
 }
 
 // The variables the bash search reads (spec 1.6), each named by a literal: the directory reads the names a module
-// reads off its source and refuses a module whose names it cannot read. An unset one is left out.
+// reads off its source and refuses a module whose names it cannot read. A variable that is unset, or whose read a
+// hook refuses, is left out: a refused `OS` leaves the host taken as not Windows, so the engine runs as before (spec
+// 1.1, R6), and on Windows a refused read skips only the step that needs it.
 async function readBashVariables($: EngineInterface): Promise<BashVariables> {
     const values: ReadonlyArray<readonly [keyof BashVariables, string | undefined]> = [
-        ['OS', await $.env.get('OS')],
-        ['SHELL', await $.env.get('SHELL')],
-        ['CLAUDE_CODE_GIT_BASH_PATH', await $.env.get('CLAUDE_CODE_GIT_BASH_PATH')],
-        ['ProgramFiles', await $.env.get('ProgramFiles')],
-        ['ProgramW6432', await $.env.get('ProgramW6432')],
-        ['ProgramFiles(x86)', await $.env.get('ProgramFiles(x86)')],
-        ['LOCALAPPDATA', await $.env.get('LOCALAPPDATA')],
-        ['PATH', await $.env.get('PATH')],
+        ['OS', await $.env.get('OS').catch((): undefined => undefined)],
+        ['SHELL', await $.env.get('SHELL').catch((): undefined => undefined)],
+        ['CLAUDE_CODE_GIT_BASH_PATH', await $.env.get('CLAUDE_CODE_GIT_BASH_PATH').catch((): undefined => undefined)],
+        ['ProgramFiles', await $.env.get('ProgramFiles').catch((): undefined => undefined)],
+        ['ProgramW6432', await $.env.get('ProgramW6432').catch((): undefined => undefined)],
+        ['ProgramFiles(x86)', await $.env.get('ProgramFiles(x86)').catch((): undefined => undefined)],
+        ['LOCALAPPDATA', await $.env.get('LOCALAPPDATA').catch((): undefined => undefined)],
+        ['PATH', await $.env.get('PATH').catch((): undefined => undefined)],
     ];
     const variables: Partial<Record<keyof BashVariables, string>> = {};
     for (const [name, value] of values) {
@@ -333,9 +335,9 @@ async function searchLauncher($: EngineInterface): Promise<Launcher> {
     return search.kind === 'found' ? { kind: 'bash', path: search.path } : { kind: 'missing' };
 }
 
-// The session's one search (spec 1.4) as the session keeps it: a search that rejects counts as one that found no
-// bash, and finding none shows the 4.1 line once. The promise never rejects, so the engine runs that await it never
-// throw there.
+// The session's one search (spec 1.4) as the session keeps it: finding no bash shows the 4.1 line once. Its reads
+// and file checks already count a refusal as unset or absent, so a search that rejects all the same counts as one
+// that found none. The promise never rejects, so the engine runs that await it never throw there.
 async function sessionLauncher($: EngineInterface): Promise<Launcher> {
     const launcher = await searchLauncher($).catch((): Launcher => ({ kind: 'missing' }));
     if (launcher.kind === 'missing') {
