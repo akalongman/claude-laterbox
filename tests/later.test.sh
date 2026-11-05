@@ -467,10 +467,14 @@ lt_in() { # dir text args...
     printf '%s' "$text" | LATER_INPUT=stdin lt "$dir" "$@"
 }
 
+# Spec 8.2's texts, each stored and matched byte for byte. Their repositories
+# hold README.md and a.md, so an @file or a glob would find something.
+STDIN_TEXTS=('@README.md' '*.md' '"quoted"' "it's" "C:\\x\\" '-x leading dash' 'შეამოწმე ექსპორტი')
+
 si="$(mk_repo)"
 printf 'SECRET\n' > "$si/README.md"
 printf 'a\n' > "$si/a.md"
-for text in '@README.md' '*.md' '"quoted"' "it's" "C:\\x\\" '-x leading dash' 'შეამოწმე ექსპორტი'; do
+for text in "${STDIN_TEXTS[@]}"; do
     assert_eq "$(lt_in "$si" "$text" add 2>&1)" "later: parked -> $text" "stdin add: $text is parked"
     assert_eq "$(lt "$si" rows | sed -n '$p' | cut -f4-)" "$text" "stdin add: $text is stored byte for byte"
 done
@@ -501,6 +505,22 @@ assert_eq "$out" "later: --if takes exactly one note number"$'\n'"exit 1" "stdin
 out="$(lt_in "$sg" 'x' drop --if 2>&1 >/dev/null; echo "exit $?")"
 assert_eq "$out" "later: --if takes exactly one note number"$'\n'"exit 1" "stdin --if: no number is refused"
 assert_eq "$(file_digest "$sg/$Q")" "$before" "stdin --if: the refused forms leave the queue byte-identical"
+
+# The guard text of the same texts, and spec 1.8's worked example, one note
+# each in that order, so note 1 is always the next to close. A glob text is
+# no pattern: *.md does not close @README.md.
+sx="$(mk_repo)"
+printf 'SECRET\n' > "$sx/README.md"
+printf 'a\n' > "$sx/a.md"
+for text in "${STDIN_TEXTS[@]}" 'fix (the) export'; do printf -- '- [ ] %s\n' "$text"; done > "$sx/$Q"
+before="$(file_digest "$sx/$Q")"
+out="$(lt_in "$sx" '*.md' done --if 1 2>&1; echo "exit $?")"
+assert_eq "$out" "later: note 1 changed since it was listed; nothing changed"$'\n'"exit 1" "stdin --if: *.md is no pattern for @README.md"
+assert_eq "$(file_digest "$sx/$Q")" "$before" "stdin --if: a refused glob text leaves the queue byte-identical"
+for text in "${STDIN_TEXTS[@]}" 'fix (the) export'; do
+    assert_eq "$(lt_in "$sx" "$text" done --if 1 2>&1)" "later: done -> $text" "stdin --if: $text is matched byte for byte"
+done
+assert_eq "$(grep -c '^- \[x\]' "$sx/$Q")" "8" "stdin --if: each text closed its own note"
 
 # --- line ends and the byte-order mark --------------------------------
 # Spec R5.3: a queue saved with CRLF line ends, or starting with a UTF-8
