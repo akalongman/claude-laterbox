@@ -443,8 +443,12 @@ assert_eq "$(printf '%s\n' "$eout" | cut -f1,2)" "queue${T}$(basename "$e")" "ro
 # shell spells it; Git Bash prints its Windows form with forward slashes,
 # which cygpath -u turns back into the shell's.
 rows_path() { printf '%s\n' "$1" | sed -n 1p | cut -f3-; } # rows output
-tb="$(mk_tmpdir)/tab${T}name"; mv "$(mk_repo)" "$tb"
-assert_eq "$(lt "$tb" rows | cut -f1,2)" "queue${T}tab name" "rows: a tab in the label becomes a space"
+if [ "$PLATFORM" = gitbash ]; then
+    skip "rows: a tab in the label becomes a space: Windows folder names cannot hold a tab"
+else
+    tb="$(mk_tmpdir)/tab${T}name"; mv "$(mk_repo)" "$tb"
+    assert_eq "$(lt "$tb" rows | cut -f1,2)" "queue${T}tab name" "rows: a tab in the label becomes a space"
+fi
 if [ "$PLATFORM" = gitbash ]; then
     for wd in "$rw" "$e"; do
         qp="$(rows_path "$(lt "$wd" rows)")"
@@ -937,16 +941,20 @@ done
 # One date call per run, not one per note (spec R5.6). This folder's date
 # records each call and runs the real one; only this case puts it first on
 # the engine's PATH.
-DATE_TRAP="$(mk_tmpdir)"
-type -P date > "$DATE_TRAP/real"
-printf '%s\n' '#!/bin/sh' 'd=${0%/*}' 'printf "%s\n" "$*" >> "$d/calls"' 'read -r real < "$d/real"' 'exec "$real" "$@"' > "$DATE_TRAP/date"
-chmod +x "$DATE_TRAP/date"
-dq="$(mk_repo)"
-for i in $(seq 1 20); do printf -- '- [ ] dated %s (2026-10-01 10:00)\n' "$i"; done > "$dq/$Q"
-out="$(ENGINE_PATH="$DATE_TRAP:$ENGINE_PATH" lt "$dq" list)"
-assert_contains "$out" "20. dated 20 (" "the date trap: list runs"
-calls=0; [ -f "$DATE_TRAP/calls" ] && calls="$(count_lines < "$DATE_TRAP/calls")"
-assert_ok "the date trap: list on 20 dated notes runs date once or twice (ran it $calls times)" between 1 2 "$calls"
+if [ "$PLATFORM" = gitbash ]; then
+    skip "the date trap: the engine puts Git's /usr/bin first on PATH, ahead of the trap"
+else
+    DATE_TRAP="$(mk_tmpdir)"
+    type -P date > "$DATE_TRAP/real"
+    printf '%s\n' '#!/bin/sh' 'd=${0%/*}' 'printf "%s\n" "$*" >> "$d/calls"' 'read -r real < "$d/real"' 'exec "$real" "$@"' > "$DATE_TRAP/date"
+    chmod +x "$DATE_TRAP/date"
+    dq="$(mk_repo)"
+    for i in $(seq 1 20); do printf -- '- [ ] dated %s (2026-10-01 10:00)\n' "$i"; done > "$dq/$Q"
+    out="$(ENGINE_PATH="$DATE_TRAP:$ENGINE_PATH" lt "$dq" list)"
+    assert_contains "$out" "20. dated 20 (" "the date trap: list runs"
+    calls=0; [ -f "$DATE_TRAP/calls" ] && calls="$(count_lines < "$DATE_TRAP/calls")"
+    assert_ok "the date trap: list on 20 dated notes runs date once or twice (ran it $calls times)" between 1 2 "$calls"
+fi
 
 # The process budget (spec R5.6): a command starts as many processes on 100
 # notes as on 5. strace wraps the engine's bash alone and logs every clone,
