@@ -14,9 +14,22 @@ import type {
     UiPane,
 } from 'claude-code';
 import type { NoteRow, Queue, Selection } from '../types/index';
+import type { BashVariables } from './bash';
+import { findBash, isWindowsHost, scriptPathOf } from './bash';
 
 // The three ways a typed note is cleaned before it is stored: the `/config` row `laterbox.rewrite`.
 type RewriteMode = 'haiku' | 'fork' | 'off';
+
+// How this session starts the engine: by the script's own path (off Windows), through the Git for Windows bash the
+// search found, or not at all, since on Windows the search found none (spec R1, 4.1).
+type Launcher =
+    | { readonly kind: 'direct' }
+    | { readonly kind: 'bash'; readonly path: string }
+    | { readonly kind: 'missing' };
+
+// What every engine run is given: the queue file setting and the launcher, which the session's search settles
+// (spec 1.4).
+type EngineContext = { readonly queueFile: string; launcher: Promise<Launcher> };
 
 // What one run of the engine script came to: its standard output, or why it did not list or store.
 type EngineOutcome = { readonly ok: true; readonly stdout: string } | { readonly ok: false; readonly reason: string };
@@ -29,12 +42,13 @@ type Parked =
     | { readonly ok: true; readonly line: string; readonly stored: string }
     | { readonly ok: false; readonly line: string };
 
-// What the module knows of this session, in one object `register` creates: the queue file setting every engine run
-// is given, whether the session is interactive (only then does a bare run open the pane), whether the pane is open,
-// whether an action on a note is running, how many reads of the queue are in flight and how many have started, and
-// the refresh timer (C1).
+// What the module knows of this session, in one object `register` creates: the queue file setting and the launcher
+// every engine run is given (an EngineContext), whether the session is interactive (only then does a bare run open
+// the pane), whether the pane is open, whether an action on a note is running, how many reads of the queue are in
+// flight and how many have started, and the refresh timer (C1).
 type PaneSession = {
     readonly queueFile: string;
+    launcher: Promise<Launcher>;
     isInteractive: boolean;
     isPaneOpen: boolean;
     isActing: boolean;
@@ -87,6 +101,13 @@ const NOTE_LINE = /^note\t(\d+)\t([^\t]*)\t(.*)$/s;
 
 // The default of the `/config` row `laterbox.file`, the queue file used when the option holds no string.
 const DEFAULT_QUEUE_FILE = 'LATER.local.md';
+
+// The reason every engine run gives on Windows when the search found no bash, and the line spec 4.1 shows once per
+// session: the reason under the plugin's name. The failure templates put `later: ` before the reason.
+const NO_BASH_REASON =
+    "Git for Windows' bash was not found. Install Git for Windows (https://git-scm.com/download/win) and restart " +
+    'Claude Code.';
+const NO_BASH_LINE = `laterbox: ${NO_BASH_REASON}`;
 
 const ENGINE_TIMEOUT_MS = 10_000;
 const COMPLETION_TIMEOUT_MS = 8_000;
@@ -279,19 +300,84 @@ function engineInit(queueFile: string, input: string | undefined): ProcessRunIni
     };
 }
 
+// The variables the bash search reads (spec 1.6), each named by a literal: the directory reads the names a module
+// reads off its source and refuses a module whose names it cannot read. An unset one is left out.
+async function readBashVariables($: EngineInterface): Promise<BashVariables> {
+    const values: ReadonlyArray<readonly [keyof BashVariables, string | undefined]> = [
+        ['OS', await $.env.get('OS')],
+        ['SHELL', await $.env.get('SHELL')],
+        ['CLAUDE_CODE_GIT_BASH_PATH', await $.env.get('CLAUDE_CODE_GIT_BASH_PATH')],
+        ['ProgramFiles', await $.env.get('ProgramFiles')],
+        ['ProgramW6432', await $.env.get('ProgramW6432')],
+        ['ProgramFiles(x86)', await $.env.get('ProgramFiles(x86)')],
+        ['LOCALAPPDATA', await $.env.get('LOCALAPPDATA')],
+        ['PATH', await $.env.get('PATH')],
+    ];
+    const variables: Partial<Record<keyof BashVariables, string>> = {};
+    for (const [name, value] of values) {
+        if (value !== undefined) {
+            variables[name] = value;
+        }
+    }
+    return variables;
+}
+
+// How this session starts the engine (spec 1.1 to 1.3): off Windows directly, as before; on Windows through the bash
+// the search finds, or not at all when it finds none.
+async function searchLauncher($: EngineInterface): Promise<Launcher> {
+    const variables = await readBashVariables($);
+    if (!isWindowsHost(variables)) {
+        return { kind: 'direct' };
+    }
+    const search = await findBash(variables, (path) => $.fs.exists(path));
+    return search.kind === 'found' ? { kind: 'bash', path: search.path } : { kind: 'missing' };
+}
+
+// The session's one search (spec 1.4) as the session keeps it: a search that rejects counts as one that found no
+// bash, and finding none shows the 4.1 line once. The promise never rejects, so the engine runs that await it never
+// throw there.
+async function sessionLauncher($: EngineInterface): Promise<Launcher> {
+    const launcher = await searchLauncher($).catch((): Launcher => ({ kind: 'missing' }));
+    if (launcher.kind === 'missing') {
+        try {
+            $.ui.toast(NO_BASH_LINE);
+        } catch {
+            // The engine runs give the same reason, so a toast that throws loses nothing they do not say.
+        }
+    }
+    return launcher;
+}
+
+// The argument vector of an engine run (spec 1.2): through the bash the search found, the script path in forward-slash
+// form after it, or the script alone, as before.
+function engineArgv(
+    launcher: Exclude<Launcher, { readonly kind: 'missing' }>,
+    root: string,
+    args: ReadonlyArray<string>,
+): ReadonlyArray<string> {
+    return launcher.kind === 'bash'
+        ? [launcher.path, scriptPathOf(root), ...args]
+        : [`${root}/scripts/later.sh`, ...args];
+}
+
 // Runs the engine by argument vector, no shell, in the session's working directory, so the queue resolves as it
-// does from a terminal, started as engineInit says. A non-zero exit and a rejection (cannot start, timeout) both
-// become a reason. The standard output comes back exactly as the engine printed it.
+// does from a terminal, started as engineInit says. It first waits for the session's search; with no bash found it
+// starts nothing and gives the 4.1 reason. A non-zero exit and a rejection (cannot start, timeout) both become a
+// reason. The standard output comes back exactly as the engine printed it.
 async function runEngineRaw(
     $: EngineInterface,
-    queueFile: string,
+    context: EngineContext,
     args: ReadonlyArray<string>,
     input?: string,
 ): Promise<EngineOutcome> {
+    const launcher = await context.launcher;
+    if (launcher.kind === 'missing') {
+        return { ok: false, reason: NO_BASH_REASON };
+    }
     try {
         const result = await $.process.run(
-            [`${$.plugin.root}/scripts/later.sh`, ...args],
-            engineInit(queueFile, input),
+            engineArgv(launcher, $.plugin.root, args),
+            engineInit(context.queueFile, input),
         );
         if (result.exitCode === 0) {
             return { ok: true, stdout: result.stdout };
@@ -305,11 +391,11 @@ async function runEngineRaw(
 // As runEngineRaw, with trailing whitespace trimmed from the standard output, for output shown as a line.
 async function runEngine(
     $: EngineInterface,
-    queueFile: string,
+    context: EngineContext,
     args: ReadonlyArray<string>,
     input?: string,
 ): Promise<EngineOutcome> {
-    const outcome = await runEngineRaw($, queueFile, args, input);
+    const outcome = await runEngineRaw($, context, args, input);
     return outcome.ok ? { ok: true, stdout: outcome.stdout.trimEnd() } : outcome;
 }
 
@@ -390,8 +476,8 @@ function paneRows(queue: Queue): number {
 // Only the newline that ends the output is removed: the engine keeps a note's trailing spaces and tabs (it drops
 // only the carriage return that ends a CRLF line), and a guarded close must send the text exactly as the engine
 // holds it.
-async function readQueue($: EngineInterface, queueFile: string): Promise<Queue> {
-    const listed = await runEngineRaw($, queueFile, ['rows']);
+async function readQueue($: EngineInterface, context: EngineContext): Promise<Queue> {
+    const listed = await runEngineRaw($, context, ['rows']);
     if (!listed.ok) {
         return { kind: 'failed', reason: listed.reason };
     }
@@ -401,9 +487,9 @@ async function readQueue($: EngineInterface, queueFile: string): Promise<Queue> 
 // Parks a typed note: the rewrite, then `add`, the note on standard input. The line is what the command prints: the
 // engine's line, followed by ` (typed: <typed>)` when the rewrite changed the text, or the failure template, which
 // keeps the typed text on screen. The pane's add shows the same line.
-async function park($: EngineInterface, mode: RewriteMode, queueFile: string, typed: string): Promise<Parked> {
+async function park($: EngineInterface, mode: RewriteMode, context: EngineContext, typed: string): Promise<Parked> {
     const stored = await rewrite($, mode, typed);
-    const added = await runEngine($, queueFile, ['add'], stored);
+    const added = await runEngine($, context, ['add'], stored);
     if (!added.ok) {
         return { ok: false, line: `later: could not park the note (${added.reason}); typed: ${typed}` };
     }
@@ -412,8 +498,8 @@ async function park($: EngineInterface, mode: RewriteMode, queueFile: string, ty
 }
 
 // The list as a transcript row, with the hidden note that it holds reminders, not tasks.
-async function listQueue($: EngineInterface, queueFile: string): Promise<CommandRunResult> {
-    const listed = await runEngine($, queueFile, ['list']);
+async function listQueue($: EngineInterface, context: EngineContext): Promise<CommandRunResult> {
+    const listed = await runEngine($, context, ['list']);
     return listed.ok ? { text: listed.stdout, context: [LIST_NOTE] } : { text: `later: ${listed.reason}` };
 }
 
@@ -437,7 +523,7 @@ async function inFlight<T>(session: PaneSession, work: (isOvertaken: () => boole
 // a queue nobody asked for at that moment.
 async function openPane($: EngineInterface, session: PaneSession): Promise<CommandRunResult> {
     const queue = await inFlight(session, async () => {
-        const listed = await readQueue($, session.queueFile);
+        const listed = await readQueue($, session);
         const selected = session.isPaneOpen
             ? reselect(await read($, queueState), listed, await read($, selectedState))
             : firstSelection(listed);
@@ -451,12 +537,12 @@ async function openPane($: EngineInterface, session: PaneSession): Promise<Comma
         .open({ id: PANE, title: 'Parked notes', focus: true, closeOnEscape: true, rows: paneRows(queue) })
         .catch((): undefined => undefined);
     if (opened === undefined) {
-        return listQueue($, session.queueFile);
+        return listQueue($, session);
     }
     if (!opened.isPlaced) {
         session.isPaneOpen = false;
         await $.ui.close({ id: PANE }).catch((): undefined => undefined);
-        return listQueue($, session.queueFile);
+        return listQueue($, session);
     }
     session.isPaneOpen = true;
     return {};
@@ -480,7 +566,7 @@ async function ringToRow($: EngineInterface, key: string): Promise<void> {
 // takes an engine run faster than a state write. `closedKey` names the note a `d` or `x` of the pane just closed.
 async function refresh($: EngineInterface, session: PaneSession, closedKey?: string): Promise<void> {
     await inFlight(session, async (isOvertaken) => {
-        const queue = await readQueue($, session.queueFile);
+        const queue = await readQueue($, session);
         const before = await read($, queueState);
         if (JSON.stringify(queue) === JSON.stringify(before)) {
             return;
@@ -598,7 +684,7 @@ async function closeSelected($: EngineInterface, session: PaneSession, mode: 'do
     if (row === undefined) {
         return;
     }
-    const closed = await runEngine($, session.queueFile, [mode, '--if', String(row.position)], row.text);
+    const closed = await runEngine($, session, [mode, '--if', String(row.position)], row.text);
     const line = closed.ok ? closed.stdout : `later: ${closed.reason}`;
     await update($, statusState, () => line);
     await refresh($, session, closed.ok ? row.key : undefined);
@@ -650,7 +736,7 @@ async function submitNote($: EngineInterface, session: PaneSession, mode: Rewrit
         return;
     }
     await update($, statusState, () => 'later: parking...');
-    const parked = await park($, mode, session.queueFile, typed);
+    const parked = await park($, mode, session, typed);
     await update($, statusState, () => parked.line);
     await refresh($, session);
 }
@@ -776,6 +862,7 @@ export const register: Register = (on, options) => {
     const mode = rewriteModeOf(options['rewrite']);
     const session: PaneSession = {
         queueFile: queueFileOf(options['file']),
+        launcher: Promise.resolve({ kind: 'direct' }),
         isInteractive: false,
         isPaneOpen: false,
         isActing: false,
@@ -788,6 +875,10 @@ export const register: Register = (on, options) => {
     // the plugin (the skill, the session-start hook) works. A reload registers the name again, which replaces the
     // earlier one.
     on('session.start', async ($, e, next) => {
+        // The bash search runs once per session (spec 1.4) and is not awaited: a slow file system never delays the
+        // start, and every engine run waits for its result. It is stored first, so nothing that runs after this start
+        // sees an earlier start's launcher.
+        session.launcher = sessionLauncher($);
         session.isInteractive = e.isInteractive;
         try {
             await $.command.register({
@@ -818,9 +909,9 @@ export const register: Register = (on, options) => {
     on('command.run', { command: 'later' }, async ($, e) => {
         const typed = collapse(e.args);
         if (typed === '') {
-            return session.isInteractive ? openPane($, session) : listQueue($, session.queueFile);
+            return session.isInteractive ? openPane($, session) : listQueue($, session);
         }
-        const parked = await park($, mode, session.queueFile, typed);
+        const parked = await park($, mode, session, typed);
         return parked.ok ? { text: parked.line, context: [parkedNote(parked.stored)] } : { text: parked.line };
     });
 

@@ -45,6 +45,9 @@ type World = {
     readonly draft?: string;
     readonly draftRead?: 'deny'; // refuses `$.prompt.read`
     readonly fill?: PromptFillResult;
+    readonly env?: Readonly<Record<string, string>> | 'deny'; // the variables `$.env.get` reads, or a refusal
+    readonly files?: ReadonlyArray<string>; // the paths `$.fs.exists` finds
+    readonly exists?: (path: string) => Promise<boolean>; // answers `$.fs.exists` in place of files
 };
 
 type Stage = {
@@ -59,6 +62,7 @@ type Stage = {
     readonly closes: string[];
     readonly focuses: string[];
     readonly fills: { readonly text: string; readonly mode: string }[];
+    readonly fileChecks: string[];
 };
 
 const PANE_ID = 'later-notes';
@@ -118,11 +122,18 @@ function engineRuns(world: Stage): EngineRun[] {
     });
 }
 
+// The path the plugin asked `$.fs.exists` about, taken from the path the hook is handed. The kit resolves a path
+// against the working directory, and where a drive path is not absolute (Linux, macOS) it puts the directory before
+// it, so a drive path is taken back from the end; any other path is kept.
+function drivePathOf(path: string): string {
+    return /[A-Za-z]:[\\/].*$/s.exec(path)?.[0] ?? path;
+}
+
 // The world beneath the plugin: every call it makes is recorded and answered from `world`, and every event the
 // tests raise has a bottom. Defaults: the registration succeeds, the engine answers as engineReply does (ROWS for
 // `rows`, LISTING for `list`, and it parks or closes by whatever text arrives on standard input), the transcript is
 // empty, the completion answers CLEAN, the fork has nothing to fork, the pane is placed, no pane is open, the draft
-// is empty and a fill succeeds.
+// is empty, a fill succeeds, no variable is set and no file exists.
 function stage(on: On, world: World = {}): Stage {
     const clock = mock.clock(on);
     const recorded: Stage = {
@@ -137,7 +148,13 @@ function stage(on: On, world: World = {}): Stage {
         closes: [],
         focuses: [],
         fills: [],
+        fileChecks: [],
     };
+    if (world.env === 'deny') {
+        on('env.get', () => ({ deny: 'refused by the test' }));
+    } else {
+        mock.env(on, world.env ?? {});
+    }
     on('session.start', (_$, e) => ({ cwd: e.cwd }));
     on('command.register', (_$, e) => {
         if (world.register === 'deny') {
@@ -205,6 +222,14 @@ function stage(on: On, world: World = {}): Stage {
     on('prompt.fill', (_$, e) => {
         recorded.fills.push({ text: e.text, mode: e.mode });
         return world.fill ?? { isFilled: true };
+    });
+    on('fs.exists', async (_$, e) => {
+        const path = drivePathOf(e.path);
+        recorded.fileChecks.push(path);
+        if (world.exists !== undefined) {
+            return { value: await world.exists(path) };
+        }
+        return { value: (world.files ?? []).includes(path) };
     });
     return recorded;
 }
@@ -1057,4 +1082,96 @@ test('a tab in the queue path stays in the path', async ($, on) => {
     expect(queues).toEqual([
         expect.objectContaining({ kind: 'read', label: 'tab name', path: '/home/u/tab\tname/LATER.local.md' }),
     ]);
+});
+
+// Git for Windows' bash launcher where its installer puts it, the bash Claude Code chose for the session as `SHELL`.
+const GIT_BASH = 'C:\\Program Files\\Git\\bin\\bash.exe';
+const WINDOWS = { OS: 'Windows_NT', SHELL: GIT_BASH };
+
+// The reason every engine run gives when no bash was found, and the line spec 4.1 shows once per session.
+const NO_BASH_REASON =
+    "Git for Windows' bash was not found. Install Git for Windows (https://git-scm.com/download/win) and restart " +
+    'Claude Code.';
+const NO_BASH_LINE = `laterbox: ${NO_BASH_REASON}`;
+
+test('on Windows the engine runs through the bash Claude Code chose', OFF, async ($, on) => {
+    const world = stage(on, { env: WINDOWS, files: [GIT_BASH] });
+    await $.session.start(SESSION);
+    await $.command.run({ command: 'later', args: 'x', ...AT_PROMPT });
+    expect(world.runs).toHaveLength(1);
+    const [bash, script, ...args] = world.runs[0] ?? [];
+    expect(bash).toBe(GIT_BASH);
+    expect(script).toEndWith('/scripts/later.sh');
+    expect(script).not.toContain('\\');
+    expect(args).toEqual(['add']);
+    expect(world.toasts).toEqual([]);
+});
+
+// The SHELL a Windows session would start, but without `OS=Windows_NT` nothing is searched.
+test('without OS=Windows_NT the engine runs directly', OFF, async ($, on) => {
+    const world = stage(on, { env: { SHELL: GIT_BASH }, files: [GIT_BASH] });
+    await $.session.start(SESSION);
+    await $.command.run({ command: 'later', args: 'x', ...AT_PROMPT });
+    expect(world.runs).toHaveLength(1);
+    expect(world.runs[0]?.[0]).toEndWith('/scripts/later.sh');
+    expect(world.runs[0]?.slice(1)).toEqual(['add']);
+    expect(world.fileChecks).toEqual([]);
+});
+
+// A session that is not interactive parks and lists; an interactive one opens the pane. Each start searches once
+// (spec 1.4) and shows the line once; the runs in between show none.
+test('no bash: one toast and a plain reason everywhere', OFF, async ($, on) => {
+    const world = stage(on, { env: { OS: 'Windows_NT' } });
+    await $.session.start(HEADLESS);
+    const parked = await $.command.run({ command: 'later', args: 'x', ...AT_PROMPT });
+    expect(parked).toEqual({ text: `later: could not park the note (${NO_BASH_REASON}); typed: x` });
+    const listed = await $.command.run({ command: 'later', args: '', ...AT_PROMPT });
+    expect(listed).toEqual({ text: `later: ${NO_BASH_REASON}` });
+    await world.clock.settle();
+    expect(world.toasts).toEqual([NO_BASH_LINE]);
+    const ui = await openPane($, 'terminal');
+    expect(await shows(ui, `later: ${NO_BASH_REASON}`)).toBe(true);
+    expect(await buttonKeys(ui)).toEqual(['add']);
+    await world.clock.settle();
+    expect(world.toasts).toEqual([NO_BASH_LINE, NO_BASH_LINE]);
+    expect(world.runs).toEqual([]);
+});
+
+test('a search that fails counts as no bash found', OFF, async ($, on) => {
+    const world = stage(on, { env: 'deny' });
+    await $.session.start(HEADLESS);
+    const parked = await $.command.run({ command: 'later', args: 'x', ...AT_PROMPT });
+    expect(parked).toEqual({ text: `later: could not park the note (${NO_BASH_REASON}); typed: x` });
+    await world.clock.settle();
+    expect(world.toasts).toEqual([NO_BASH_LINE]);
+    expect(world.runs).toEqual([]);
+});
+
+// An answer the test holds until it releases it.
+function held<T>(): { readonly promise: Promise<T>; readonly release: (value: T) => void } {
+    let release: (value: T) => void = () => undefined;
+    const promise = new Promise<T>((settle) => {
+        release = settle;
+    });
+    return { promise, release };
+}
+
+// The search's file check is held: the start resolves meanwhile, and a `/later` that arrives before the search
+// finished waits for it, then runs through the bash it found.
+test('session start does not wait for the search', OFF, async ($, on) => {
+    const answer = held<boolean>();
+    const world = stage(on, { env: WINDOWS, exists: () => answer.promise });
+    let isStarted = false;
+    const started = $.session.start(SESSION).then(() => {
+        isStarted = true;
+    });
+    await world.clock.settle();
+    expect(isStarted).toBe(true);
+    expect(world.fileChecks).toEqual([GIT_BASH]);
+    const run = $.command.run({ command: 'later', args: 'x', ...AT_PROMPT });
+    await world.clock.settle();
+    expect(world.runs).toEqual([]);
+    answer.release(true);
+    await Promise.all([started, run]);
+    expect(world.runs[0]?.[0]).toBe(GIT_BASH);
 });
