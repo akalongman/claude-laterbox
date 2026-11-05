@@ -16,6 +16,8 @@ import type {
 import type { NoteRow, Queue, Selection } from '../types/index';
 import type { BashVariables } from './bash';
 import { findBash, isWindowsHost, scriptPathOf } from './bash';
+import type { RunFailure } from './failure';
+import { failureKindOf, failureReason } from './failure';
 
 // The three ways a typed note is cleaned before it is stored: the `/config` row `laterbox.rewrite`.
 type RewriteMode = 'haiku' | 'fork' | 'off';
@@ -365,7 +367,7 @@ function engineArgv(
 // Runs the engine by argument vector, no shell, in the session's working directory, so the queue resolves as it
 // does from a terminal, started as engineInit says. It first waits for the session's search; with no bash found it
 // starts nothing and gives the 4.1 reason. A non-zero exit and a rejection (cannot start, timeout) both become a
-// reason. The standard output comes back exactly as the engine printed it.
+// failed run, as failedRun reports it. The standard output comes back exactly as the engine printed it.
 async function runEngineRaw(
     $: EngineInterface,
     context: EngineContext,
@@ -376,18 +378,43 @@ async function runEngineRaw(
     if (launcher.kind === 'missing') {
         return { ok: false, reason: NO_BASH_REASON };
     }
+    const argv = engineArgv(launcher, $.plugin.root, args);
+    let failure: RunFailure;
     try {
-        const result = await $.process.run(
-            engineArgv(launcher, $.plugin.root, args),
-            engineInit(context.queueFile, input),
-        );
+        const result = await $.process.run(argv, engineInit(context.queueFile, input));
         if (result.exitCode === 0) {
             return { ok: true, stdout: result.stdout };
         }
-        return { ok: false, reason: reasonOf(result.stderr, `exit code ${result.exitCode}`) };
+        failure = { kind: 'exited', exitCode: result.exitCode, stderr: result.stderr };
     } catch (error: unknown) {
-        return { ok: false, reason: messageOf(error) };
+        failure = { kind: 'rejected', message: messageOf(error) };
     }
+    return failedRun($, failure, launcher.kind, argv[0] ?? '');
+}
+
+// A failed engine run as runEngineRaw reports it (spec 4.2): what the run said goes to the debug log alone, and the
+// reason is the plain one of its kind; `started` is the program the run started, the first argument. The engine's
+// own reason is today's: the first line of its stderr, else the exit code; a rejection is never of the engine's
+// kind, so its message only stands in.
+function failedRun(
+    $: EngineInterface,
+    failure: RunFailure,
+    launcher: 'direct' | 'bash',
+    started: string,
+): EngineOutcome {
+    debugLog($, `later: engine run failed: ${rawFailureOf(failure)}`);
+    const engineReason =
+        failure.kind === 'exited' ? reasonOf(failure.stderr, `exit code ${failure.exitCode}`) : failure.message;
+    return { ok: false, reason: failureReason(failureKindOf(failure, launcher), { started, engineReason }) };
+}
+
+// What a failed run said, for the debug log: the rejection's message, or the exit code and the standard error.
+function rawFailureOf(failure: RunFailure): string {
+    if (failure.kind === 'rejected') {
+        return failure.message;
+    }
+    const stderr = failure.stderr.trim();
+    return stderr === '' ? `exit code ${failure.exitCode}` : `exit code ${failure.exitCode}: ${stderr}`;
 }
 
 // As runEngineRaw, with trailing whitespace trimmed from the standard output, for output shown as a line.

@@ -33,7 +33,7 @@ type EngineReply = { readonly exitCode: number; readonly stdout: string; readonl
 // What the world beneath the plugin answers; every field has a default (see stage).
 type World = {
     readonly register?: 'deny';
-    readonly engine?: EngineReply | 'deny'; // answers every engine run
+    readonly engine?: EngineReply | 'deny' | { readonly deny: string }; // answers every run; 'deny' is spawn ENOENT
     readonly rows?: () => string; // stdout of `later.sh rows`
     readonly closeNote?: (args: ReadonlyArray<string>, text: string) => EngineReply; // answers `done` and `drop`
     readonly add?: (note: string) => EngineReply; // answers `add`
@@ -64,6 +64,7 @@ type Stage = {
     readonly focuses: string[];
     readonly fills: { readonly text: string; readonly mode: string }[];
     readonly fileChecks: string[];
+    readonly debugLines: string[];
 };
 
 const PANE_ID = 'later-notes';
@@ -150,6 +151,7 @@ function stage(on: On, world: World = {}): Stage {
         focuses: [],
         fills: [],
         fileChecks: [],
+        debugLines: [],
     };
     const { env = {}, isEnvRefused } = world;
     if (isEnvRefused === undefined) {
@@ -169,13 +171,23 @@ function stage(on: On, world: World = {}): Stage {
         recorded.toasts.push(e.text);
         return { value: undefined };
     });
+    on('ui.log', (_$, e) => {
+        if (e.to === 'debug') {
+            recorded.debugLines.push(e.text);
+        }
+        return { value: undefined };
+    });
     on('process.run', (_$, e) => {
         recorded.runs.push([...e.argv]);
         recorded.inits.push(e.init);
-        if (world.engine === 'deny') {
+        const { engine } = world;
+        if (engine === 'deny') {
             return { deny: 'spawn ENOENT' };
         }
-        const reply = world.engine ?? engineReply(world, e.argv.slice(1), e.init?.stdin ?? '');
+        if (engine !== undefined && 'deny' in engine) {
+            return { deny: engine.deny };
+        }
+        const reply = engine ?? engineReply(world, e.argv.slice(1), e.init?.stdin ?? '');
         return { value: { ...reply, isStdoutTruncated: false, isStderrTruncated: false } };
     });
     on('session.messages', () =>
@@ -319,29 +331,52 @@ test('shell-special characters reach the engine verbatim', OFF, async ($, on) =>
 });
 
 test('an engine exit code names the reason and keeps the typed text on screen', OFF, async ($, on) => {
-    stage(on, { engine: { exitCode: 1, stdout: '', stderr: 'later: the queue is locked by another writer\n' } });
+    const world = stage(on, {
+        engine: { exitCode: 1, stdout: '', stderr: 'later: the queue is locked by another writer\n' },
+    });
     await $.session.start(SESSION);
     const result = await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
     expect(result).toEqual({
         text: `later: could not park the note (the queue is locked by another writer); typed: ${TYPED}`,
     });
+    expect(world.debugLines).toEqual([
+        'later: engine run failed: exit code 1: later: the queue is locked by another writer',
+    ]);
 });
 
 test('an engine exit code without stderr names the code', OFF, async ($, on) => {
-    stage(on, { engine: { exitCode: 2, stdout: '', stderr: '' } });
+    const world = stage(on, { engine: { exitCode: 2, stdout: '', stderr: '' } });
     await $.session.start(SESSION);
     const result = await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
     expect(result).toEqual({ text: `later: could not park the note (exit code 2); typed: ${TYPED}` });
+    expect(world.debugLines).toEqual(['later: engine run failed: exit code 2']);
 });
 
-test('an engine that cannot start reports the rejection', OFF, async ($, on) => {
-    stage(on, { engine: 'deny' });
+// The kit's runs start the script directly, so a start the system cannot make means the script is not there.
+test('an engine that cannot start names the files as incomplete', OFF, async ($, on) => {
+    const world = stage(on, { engine: 'deny' });
     await $.session.start(SESSION);
-    const result = await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
-    expect(result.context).toBeUndefined();
-    expect(result.text).toStartWith('later: could not park the note (');
-    expect(result.text).toContain('spawn ENOENT');
-    expect(result.text).toEndWith(`; typed: ${TYPED}`);
+    const result = await $.command.run({ command: 'later', args: 'x', ...AT_PROMPT });
+    expect(result).toEqual({
+        text: "later: could not park the note (laterbox's files are incomplete; reinstall the plugin); typed: x",
+    });
+    expect(world.debugLines).toHaveLength(1);
+    expect(world.debugLines[0]).toMatch(/^later: engine run failed: .*\bspawn ENOENT$/);
+});
+
+test('a refused start names the program', OFF, async ($, on) => {
+    const world = stage(on, { engine: { deny: 'spawn EACCES' } });
+    await $.session.start(SESSION);
+    const result = await $.command.run({ command: 'later', args: 'x', ...AT_PROMPT });
+    const [started = ''] = world.runs[0] ?? [];
+    expect(started).toEndWith('/scripts/later.sh');
+    expect(result).toEqual({
+        text:
+            `later: could not park the note (the system refused to start ${started}; check its permissions or your ` +
+            'security software); typed: x',
+    });
+    expect(world.debugLines).toHaveLength(1);
+    expect(world.debugLines[0]).toMatch(/^later: engine run failed: .*\bspawn EACCES$/);
 });
 
 test("a listing that fails prints the engine's reason alone", OFF, async ($, on) => {
@@ -1107,6 +1142,21 @@ test('on Windows the engine runs through the bash Claude Code chose', OFF, async
     expect(script).not.toContain('\\');
     expect(args).toEqual(['add']);
     expect(world.toasts).toEqual([]);
+});
+
+// The bash the search found at session start no longer starts: the reason names it and asks for a restart.
+test('a bash that is gone asks for a restart', OFF, async ($, on) => {
+    const world = stage(on, { env: WINDOWS, files: [GIT_BASH], engine: 'deny' });
+    await $.session.start(SESSION);
+    const result = await $.command.run({ command: 'later', args: 'x', ...AT_PROMPT });
+    expect(world.runs[0]?.[0]).toBe(GIT_BASH);
+    expect(result).toEqual({
+        text:
+            `later: could not park the note (the bash at ${GIT_BASH} is gone; restart Claude Code to search ` +
+            'again); typed: x',
+    });
+    expect(world.debugLines).toHaveLength(1);
+    expect(world.debugLines[0]).toMatch(/^later: engine run failed: .*\bspawn ENOENT$/);
 });
 
 // The SHELL a Windows session would start, but without `OS=Windows_NT` nothing is searched.
