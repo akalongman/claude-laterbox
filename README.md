@@ -24,7 +24,7 @@ What you type:
 | A session | `/later <note>` | Parks the note at once, even while a turn is running, after a model has cleaned its text |
 | A session | `/later` | Opens a pane to work through the parked notes |
 | A session | "what is parked", "tick off note 2", "park this for later" | The skill `laterbox:notes` lists, parks, closes and drops notes |
-| A terminal | `later`, `later <note>`, `later done <n>`, `later drop <n>`, `later all` | The same queue from any shell |
+| A terminal | `later`, `later <note>`, `later done <n>`, `later drop <n>`, `later all` | The same queue from any shell on Linux and macOS |
 
 At the start of a terminal session a line shows the count of parked notes.
 
@@ -85,7 +85,7 @@ see it.
 
 ### The terminal command
 
-From any terminal, in a project:
+From any terminal on Linux and macOS, in a project:
 
 | Command | What it does |
 |---|---|
@@ -171,7 +171,7 @@ skip it.
 - A `SessionStart` hook for new sessions:
   `bash "${CLAUDE_PLUGIN_ROOT}/scripts/later.sh" session-start`, with a
   10-second timeout. It prints the session-start line, keeps the terminal
-  link and stores the queue file setting.
+  link on Linux and macOS and stores the queue file setting.
 - A hooks module, `hooks/register.tsx`, that Claude Code loads. It registers
   `/later` and the tool `queue`, draws the pane, runs `scripts/later.sh` as a
   process (no shell, 10-second timeout; on Windows through Git for Windows'
@@ -350,7 +350,7 @@ The settings appear in `/config` as `laterbox.<key>`.
 | Setting | Values | Default | What it does |
 |---|---|---|---|
 | `laterbox.rewrite` | `haiku`, `fork`, `off` | `haiku` | How `/later` and the pane clean a note before storing it; see [What it sends](#what-it-sends) |
-| `laterbox.terminal` | `link`, `off` | `link` | `link` keeps `~/.local/bin/later` at each terminal session start; `off` removes the link the plugin made at the next session start and adds none |
+| `laterbox.terminal` | `link`, `off` | `link` | `link` keeps `~/.local/bin/later` at each terminal session start on Linux and macOS; `off` removes the link the plugin made at the next session start and adds none |
 | `laterbox.file` | a file name | `LATER.local.md` | The queue file's name at every project's root |
 
 Pick a `laterbox.file` name that no other tool or person uses: the engine
