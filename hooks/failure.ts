@@ -14,8 +14,8 @@ export type FailureKind = 'bash_gone' | 'script_missing' | 'refused' | 'timeout'
 // A rejection that says the system refused the start: an access error, or Windows' own words for one.
 const REFUSED = /\b(EACCES|EPERM)\b|access is denied/i;
 
-// A rejection that says the run ran out of time.
-const TIMED_OUT = /timed? ?out|ETIMEDOUT/i;
+// A rejection that says the run ran out of time; Claude Code's own says the run was still running after its time.
+const TIMED_OUT = /timed? ?out|ETIMEDOUT|still running after/i;
 
 // The exit code bash gives when it cannot find the script it was given.
 const NOT_FOUND_EXIT_CODE = 127;

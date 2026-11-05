@@ -4,6 +4,10 @@ import { failureKindOf, failureReason } from './failure';
 
 const GIT_BASH = 'C:\\Program Files\\Git\\bin\\bash.exe';
 
+// How Claude Code rejects a run of each launcher that outlasted its time.
+const STILL_RUNNING_DIRECT = 'laterbox: $.process.run(/plugin/scripts/later.sh) aborted: still running after 10000ms';
+const STILL_RUNNING_BASH = 'laterbox: $.process.run(/c/x/bash.exe) aborted: still running after 10000ms';
+
 // What Git's bash prints when the script it was given is not there.
 const NO_SCRIPT = 'bash: /c/laterbox/scripts/later.sh: No such file or directory\n';
 
@@ -23,6 +27,8 @@ const KINDS: ReadonlyArray<readonly [string, RunFailure, 'direct' | 'bash', Fail
     ["Windows' access is denied", rejected('Access is denied.'), 'bash', 'refused'],
     ['a run that timed out under bash', rejected('process timed out after 10000 ms'), 'bash', 'timeout'],
     ['a run that timed out under direct', rejected('process timed out after 10000 ms'), 'direct', 'timeout'],
+    ["Claude Code's timeout under direct", rejected(STILL_RUNNING_DIRECT), 'direct', 'timeout'],
+    ["Claude Code's timeout under bash", rejected(STILL_RUNNING_BASH), 'bash', 'timeout'],
     ['spawn ENOENT under bash', rejected('spawn ENOENT'), 'bash', 'bash_gone'],
     ['spawn ENOENT under direct', rejected('spawn ENOENT'), 'direct', 'script_missing'],
     ['exit 127', exited(127, NO_SCRIPT), 'bash', 'script_missing'],
