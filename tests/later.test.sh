@@ -15,6 +15,8 @@ source "$HERE/assert.sh"
 unset CLAUDE_PLUGIN_DATA CLAUDE_PLUGIN_OPTION_TERMINAL CLAUDE_PLUGIN_OPTION_FILE XDG_STATE_HOME
 # The lock cases choose the lock themselves.
 unset LATER_NO_FLOCK
+# The standard input cases set LATER_INPUT themselves, on their own runs.
+unset LATER_INPUT
 ENGINE="$HERE/../scripts/later.sh"
 # The PATH of every engine run, front-end runs included. CI narrows it to the
 # system folders, so the engine cannot lean on a tool the user installed.
@@ -426,12 +428,53 @@ printf '%s\n' '# Parked notes (`/later`)' '' \
     '- [ ] undated one' > "$rw/$Q"
 printf -- '- [ ] split\there\n' >> "$rw/$Q"
 out="$(lt "$rw" rows)"
-assert_eq "$(printf '%s\n' "$out" | sed -n 1p)" "queue${T}$(basename "$rw")" "rows starts with the queue line"
+assert_eq "$(printf '%s\n' "$out" | sed -n 1p | cut -f1,2)" "queue${T}$(basename "$rw")" "rows starts with the queue line"
 assert_eq "$(printf '%s\n' "$out" | sed -n 2p)" "note${T}1${T}3d${T}Check the S3 retry path" "rows: position, age, text without the stamp"
 assert_eq "$(printf '%s\n' "$out" | sed -n 3p)" "note${T}2${T}undated${T}undated one" "rows leaves closed notes out"
 assert_eq "$(printf '%s\n' "$out" | sed -n 4p)" "note${T}3${T}undated${T}split${T}here" "rows keeps a tab inside a note's text"
 assert_eq "$(printf '%s\n' "$out" | count_lines)" "4" "rows prints nothing else"
-assert_eq "$(lt "$e" rows)" "queue${T}$(basename "$e")" "rows without a queue file prints the queue line alone"
+eout="$(lt "$e" rows)"
+assert_eq "$(printf '%s\n' "$eout" | cut -f1,2)" "queue${T}$(basename "$e")" "rows without a queue file prints the queue line alone"
+
+# Spec 2.1: the queue line ends in a third field, the queue file's absolute
+# path, printed whether or not the file exists, which the pane watches
+# through the module's file layer. A tab in the label becomes a space, so the
+# path is always the third field. Linux and macOS print the path as the
+# shell spells it; Git Bash prints its Windows form with forward slashes,
+# which cygpath -u turns back into the shell's.
+rows_path() { printf '%s\n' "$1" | sed -n 1p | cut -f3-; } # rows output
+if [ "$PLATFORM" = gitbash ]; then
+    skip "rows: a tab in the label becomes a space: Windows folder names cannot hold a tab"
+else
+    tb="$(mk_tmpdir)/tab${T}name"; mv "$(mk_repo)" "$tb"
+    assert_eq "$(lt "$tb" rows | cut -f1,2)" "queue${T}tab name" "rows: a tab in the label becomes a space"
+fi
+if [ "$PLATFORM" = gitbash ]; then
+    for wd in "$rw" "$e"; do
+        qp="$(rows_path "$(lt "$wd" rows)")"
+        assert_ok "rows under Git Bash: the queue path is a Windows path with forward slashes ($qp)" grep -qE '^[A-Za-z]:/' <<< "$qp"
+        assert_eq "$(cygpath -u "$qp")" "$(cd -P "$wd" && pwd)/$Q" "rows under Git Bash: cygpath -u of the queue path is the queue file's path (${wd##*/})"
+    done
+else
+    assert_eq "$(rows_path "$out")" "$(cd -P "$rw" && pwd)/$Q" "rows: the queue line ends in the queue file's absolute path"
+    assert_eq "$(rows_path "$eout")" "$(cd -P "$e" && pwd)/$Q" "rows without a queue file: the queue line still names the queue file's path"
+    assert_eq "$(rows_path "$(lt "$tb" rows)")" "$(cd -P "$tb" && pwd)/$Q" "rows: a tab in the folder's name stays in the path"
+    skip "rows: the queue path in its Windows form: Git Bash only"
+fi
+
+# Review Focus 3: a queue in a folder whose name holds a space and non-ASCII
+# letters. The queue line names it byte for byte, in a UTF-8 locale and
+# under LC_ALL=C alike.
+np="$(mk_tmpdir)/ნინო proj"; mv "$(mk_repo)" "$np"
+printf '%s\n' '- [ ] one' > "$np/$Q"
+for loc in '' C; do
+    out="$(LC_ALL=$loc lt "$np" rows)"
+    assert_eq "$(printf '%s\n' "$out" | sed -n 1p | cut -f1,2)" "queue${T}ნინო proj" "a folder named ნინო proj (${loc:+LC_ALL=}${loc:-default locale}): the label"
+    qp="$(rows_path "$out")"
+    [ "$PLATFORM" != gitbash ] || qp="$(cygpath -u "$qp")"
+    assert_eq "$qp" "$(cd -P "$np" && pwd)/$Q" "a folder named ნინო proj (${loc:+LC_ALL=}${loc:-default locale}): the queue line names the queue file exactly"
+done
+
 gone="$(mktemp -d)"
 out="$( cd "$gone" && rmdir "$gone" && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" PATH="$ENGINE_PATH" bash "$ENGINE" rows 2>&1; echo "exit $?" )"
 assert_contains "$out" "later: cannot resolve the queue here" "rows names an unresolvable queue"
@@ -452,6 +495,73 @@ assert_contains "$(lt "$gq" list)" "$(basename "$gq"): 1 parked" "refused --if f
 assert_eq "$(lt "$rw" done --if 'Check the S3 retry path' 1)" "later: done -> Check the S3 retry path" "--if compares the text without its stamp"
 assert_eq "$(lt "$rw" drop --if "split${T}here" 2)" "later: dropped -> split${T}here" "--if matches a text holding a tab"
 assert_contains "$(XDG_STATE_HOME="$T_STATE" PATH="$ENGINE_PATH" bash "$ENGINE" 2>&1)" "done [--if <text>] <n>..." "usage names the --if form"
+
+# --- user text on standard input --------------------------------------
+# Spec 1.8: with LATER_INPUT=stdin the note of add and the expected text of a
+# guarded done or drop come from standard input, byte for byte, never from an
+# argument, which Git for Windows' runtime would rewrite (@file, globs).
+
+# Runs the engine as lt does, with LATER_INPUT=stdin and <text> on standard
+# input, no newline added.
+lt_in() { # dir text args...
+    local dir="$1" text="$2"; shift 2
+    printf '%s' "$text" | LATER_INPUT=stdin lt "$dir" "$@"
+}
+
+# Spec 8.2's texts, each stored and matched byte for byte. Their repositories
+# hold README.md and a.md, so an @file or a glob would find something.
+STDIN_TEXTS=('@README.md' '*.md' '"quoted"' "it's" "C:\\x\\" '-x leading dash' 'შეამოწმე ექსპორტი')
+
+si="$(mk_repo)"
+printf 'SECRET\n' > "$si/README.md"
+printf 'a\n' > "$si/a.md"
+for text in "${STDIN_TEXTS[@]}"; do
+    assert_eq "$(lt_in "$si" "$text" add 2>&1)" "later: parked -> $text" "stdin add: $text is parked"
+    assert_eq "$(lt "$si" rows | sed -n '$p' | cut -f4-)" "$text" "stdin add: $text is stored byte for byte"
+done
+assert_eq "$(lt "$si" rows | count_lines)" "8" "stdin add: one note per run"
+before="$(file_digest "$si/$Q")"
+for text in '' '   ' $'\n\t\r\n'; do
+    assert_eq "$(lt_in "$si" "$text" add 2>&1)" "later: nothing to park (empty note)" "stdin add: an empty or blank input is refused"
+done
+assert_eq "$(file_digest "$si/$Q")" "$before" "stdin add: a refused note leaves the queue byte-identical"
+out="$(lt_in "$si" 'x' add extra 2>&1 >/dev/null; echo "exit $?")"
+assert_eq "$out" "later: add takes its note from standard input here"$'\n'"exit 1" "stdin add: an argument is refused on stderr"
+assert_eq "$(file_digest "$si/$Q")" "$before" "stdin add: a refused argument leaves the queue byte-identical"
+assert_eq "$(printf 'x' | LATER_INPUT=args lt "$si" add from the arguments 2>&1)" "later: parked -> from the arguments" "another LATER_INPUT value: add takes its arguments"
+
+sg="$(mk_repo)"
+printf '%s\n' '- [ ] ends here  ' '- [ ] other' > "$sg/$Q"
+before="$(file_digest "$sg/$Q")"
+out="$(lt_in "$sg" 'ends here' done --if 1 2>&1; echo "exit $?")"
+assert_eq "$out" "later: note 1 changed since it was listed; nothing changed"$'\n'"exit 1" "stdin --if: the text without its trailing spaces is refused"
+assert_eq "$(file_digest "$sg/$Q")" "$before" "stdin --if: a refused close leaves the queue byte-identical"
+assert_eq "$(lt_in "$sg" 'ends here  ' done --if 1 2>&1)" "later: done -> ends here  " "stdin --if: the exact text closes the note"
+assert_eq "$(sed -n 1p "$sg/$Q")" "- [x] ends here  " "stdin --if: done ticks the box and keeps the trailing spaces"
+before="$(file_digest "$sg/$Q")"
+out="$(lt_in "$sg" $'other\n' drop --if 1 2>&1; echo "exit $?")"
+assert_eq "$out" "later: note 1 changed since it was listed; nothing changed"$'\n'"exit 1" "stdin --if: a newline after the text is part of the text"
+out="$(lt_in "$sg" 'x' drop --if 1 2 2>&1 >/dev/null; echo "exit $?")"
+assert_eq "$out" "later: --if takes exactly one note number"$'\n'"exit 1" "stdin --if: two numbers are refused"
+out="$(lt_in "$sg" 'x' drop --if 2>&1 >/dev/null; echo "exit $?")"
+assert_eq "$out" "later: --if takes exactly one note number"$'\n'"exit 1" "stdin --if: no number is refused"
+assert_eq "$(file_digest "$sg/$Q")" "$before" "stdin --if: the refused forms leave the queue byte-identical"
+
+# The guard text of the same texts, and spec 1.8's worked example, one note
+# each in that order, so note 1 is always the next to close. A glob text is
+# no pattern: *.md does not close @README.md.
+sx="$(mk_repo)"
+printf 'SECRET\n' > "$sx/README.md"
+printf 'a\n' > "$sx/a.md"
+for text in "${STDIN_TEXTS[@]}" 'fix (the) export'; do printf -- '- [ ] %s\n' "$text"; done > "$sx/$Q"
+before="$(file_digest "$sx/$Q")"
+out="$(lt_in "$sx" '*.md' done --if 1 2>&1; echo "exit $?")"
+assert_eq "$out" "later: note 1 changed since it was listed; nothing changed"$'\n'"exit 1" "stdin --if: *.md is no pattern for @README.md"
+assert_eq "$(file_digest "$sx/$Q")" "$before" "stdin --if: a refused glob text leaves the queue byte-identical"
+for text in "${STDIN_TEXTS[@]}" 'fix (the) export'; do
+    assert_eq "$(lt_in "$sx" "$text" done --if 1 2>&1)" "later: done -> $text" "stdin --if: $text is matched byte for byte"
+done
+assert_eq "$(grep -c '^- \[x\]' "$sx/$Q")" "8" "stdin --if: each text closed its own note"
 
 # --- line ends and the byte-order mark --------------------------------
 # Spec R5.3: a queue saved with CRLF line ends, or starting with a UTF-8
@@ -566,6 +676,19 @@ else
     ln -s "$ltarget/gone.md" "$lroot/dangling/$Q"
     ln -s "$ltarget/$Q" "$lroot/tofolder/$Q"
     assert_eq "$(all "$lroot")" "  1 open, oldest undated   $lroot/p"$'\n'"  1 open in 1 queues" "all skips a dangling link, a link to a folder and a folder named like the queue"
+fi
+
+# Spec 1.7: under Git Bash the engine puts Git's /usr/bin before Windows'
+# system folders, so a PATH that starts with System32 cannot hand all
+# Windows' find.exe and sort.exe. The engine's bash is started by its own
+# path here, because System32 can hold WSL's bash.exe.
+if [ "$PLATFORM" = gitbash ]; then
+    s32="$(mk_tmpdir)"; mkdir -p "$s32/p"
+    printf '%s\n' '- [ ] one open' > "$s32/p/$Q"
+    out="$( cd / && HOME="$T_HOME" XDG_CACHE_HOME="$T_CACHE" XDG_STATE_HOME="$T_STATE" TZ="$ZONE" LATER_NOW="$NOW" LATER_ROOTS="$s32" PATH="/c/Windows/System32:$ENGINE_PATH" "$BASH" "$ENGINE" all )"
+    assert_eq "$out" "  1 open, oldest undated   $s32/p"$'\n'"  1 open in 1 queues" "all with System32 first on PATH lists the queue, by Git's find and sort"
+else
+    skip "all with System32 first on PATH: Git Bash only"
 fi
 
 # --- session-start ----------------------------------------------------
@@ -818,16 +941,20 @@ done
 # One date call per run, not one per note (spec R5.6). This folder's date
 # records each call and runs the real one; only this case puts it first on
 # the engine's PATH.
-DATE_TRAP="$(mk_tmpdir)"
-type -P date > "$DATE_TRAP/real"
-printf '%s\n' '#!/bin/sh' 'd=${0%/*}' 'printf "%s\n" "$*" >> "$d/calls"' 'read -r real < "$d/real"' 'exec "$real" "$@"' > "$DATE_TRAP/date"
-chmod +x "$DATE_TRAP/date"
-dq="$(mk_repo)"
-for i in $(seq 1 20); do printf -- '- [ ] dated %s (2026-10-01 10:00)\n' "$i"; done > "$dq/$Q"
-out="$(ENGINE_PATH="$DATE_TRAP:$ENGINE_PATH" lt "$dq" list)"
-assert_contains "$out" "20. dated 20 (" "the date trap: list runs"
-calls=0; [ -f "$DATE_TRAP/calls" ] && calls="$(count_lines < "$DATE_TRAP/calls")"
-assert_ok "the date trap: list on 20 dated notes runs date once or twice (ran it $calls times)" between 1 2 "$calls"
+if [ "$PLATFORM" = gitbash ]; then
+    skip "the date trap: the engine puts Git's /usr/bin first on PATH, ahead of the trap"
+else
+    DATE_TRAP="$(mk_tmpdir)"
+    type -P date > "$DATE_TRAP/real"
+    printf '%s\n' '#!/bin/sh' 'd=${0%/*}' 'printf "%s\n" "$*" >> "$d/calls"' 'read -r real < "$d/real"' 'exec "$real" "$@"' > "$DATE_TRAP/date"
+    chmod +x "$DATE_TRAP/date"
+    dq="$(mk_repo)"
+    for i in $(seq 1 20); do printf -- '- [ ] dated %s (2026-10-01 10:00)\n' "$i"; done > "$dq/$Q"
+    out="$(ENGINE_PATH="$DATE_TRAP:$ENGINE_PATH" lt "$dq" list)"
+    assert_contains "$out" "20. dated 20 (" "the date trap: list runs"
+    calls=0; [ -f "$DATE_TRAP/calls" ] && calls="$(count_lines < "$DATE_TRAP/calls")"
+    assert_ok "the date trap: list on 20 dated notes runs date once or twice (ran it $calls times)" between 1 2 "$calls"
+fi
 
 # The process budget (spec R5.6): a command starts as many processes on 100
 # notes as on 5. strace wraps the engine's bash alone and logs every clone,
