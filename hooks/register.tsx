@@ -20,6 +20,16 @@ import type { RunFailure } from './failure';
 import { failureKindOf, failureReason } from './failure';
 import type { FileLook, GateMemo } from './gate';
 import { needsRead } from './gate';
+import { engineCallOf, parseToolInput, TOOL_DESCRIPTION, TOOL_INPUT_SCHEMA } from './tool';
+
+// The queue tool's arguments as the model sent them. Declared here, the tool's name types the `tool.call` hook below
+// whatever MCP tools the type root lists (a root written while servers were connected lists theirs alone). Declared
+// loose, a call that breaks the schema still reaches parseToolInput, which refuses it with a reason.
+declare module 'claude-code' {
+    interface McpToolInputs {
+        mcp__laterbox__queue: Readonly<Record<string, unknown>>;
+    }
+}
 
 // The three ways a typed note is cleaned before it is stored: the `/config` row `laterbox.rewrite`.
 type RewriteMode = 'haiku' | 'fork' | 'off';
@@ -1041,6 +1051,18 @@ export const register: Register = (on, options) => {
         } catch (error: unknown) {
             $.ui.toast(`later: could not register /later: ${messageOf(error)}`);
         }
+        // The tool the skill reaches the engine through (spec 3.1), in every session, interactive or not, and listed
+        // in the prompt rather than behind ToolSearch. A refusal leaves /later and the pane working.
+        try {
+            await $.tool.register({
+                name: 'queue',
+                description: TOOL_DESCRIPTION,
+                inputSchema: TOOL_INPUT_SCHEMA,
+                isDeferred: false,
+            });
+        } catch (error: unknown) {
+            $.ui.toast(`later: could not register the queue tool: ${messageOf(error)}`);
+        }
         // One refresh timer per session (C1). A reload drops the module with its timer and starts here again, and the
         // engine's record says whether the pane stayed up; a record that cannot be read counts it as closed. A timer
         // of an earlier start is stopped first, so a second start never leaves two running.
@@ -1064,6 +1086,21 @@ export const register: Register = (on, options) => {
         }
         const parked = await park($, mode, session, typed);
         return parked.ok ? { text: parked.line, context: [parkedNote(parked.stored)] } : { text: parked.line };
+    });
+
+    // The queue tool (spec 3.1, 3.2). Its own arguments are checked first, and an invalid call is refused without a
+    // run. A valid one runs the engine as `/later` does, user text on standard input; a `done` or `drop` is guarded
+    // by the note's text, so a queue that changed since the model's listing refuses it and changes nothing. The
+    // engine's output is the result, and any failure reaches the model as a refusal. The tool is the module's own:
+    // a call no hook answers fails, so next is never called. The module answers no `tool.check` for it (spec 3.5).
+    on('tool.call', { tool: 'mcp__laterbox__queue' }, async ($, e) => {
+        const parsed = parseToolInput(e);
+        if (!parsed.ok) {
+            return { deny: `later: ${parsed.reason}` };
+        }
+        const { args, input } = engineCallOf(parsed.request);
+        const ran = await runEngine($, session, args, input);
+        return ran.ok ? { result: ran.stdout } : { deny: `later: ${ran.reason}` };
     });
 
     on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => drawPane($, e, session, mode));

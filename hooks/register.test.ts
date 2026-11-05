@@ -8,12 +8,14 @@ import type {
     PaneOpenArgs,
     ProcessRunInit,
     PromptFillResult,
+    RegisteredToolSpec,
     SessionMessage,
     UiFocusResult,
     UiPane,
 } from 'claude-code';
 import type { Engine, MockClock, Mounted, Plugin } from 'claude-code/testing';
 import { describe, expect, mock, test } from 'claude-code/testing';
+import { TOOL_DESCRIPTION, TOOL_INPUT_SCHEMA } from './tool';
 
 const SESSION = { cwd: '/home/u/projects/org/app', surface: 'terminal', isInteractive: true } as const;
 const CLEAN = 'Check the S3 retry path in UploadJob';
@@ -33,6 +35,7 @@ type EngineReply = { readonly exitCode: number; readonly stdout: string; readonl
 // What the world beneath the plugin answers; every field has a default (see stage).
 type World = {
     readonly register?: 'deny';
+    readonly toolRegister?: 'deny'; // refuses `$.tool.register`
     readonly engine?: EngineReply | 'deny' | { readonly deny: string }; // answers every run; 'deny' is spawn ENOENT
     readonly rows?: () => string; // stdout of `later.sh rows`
     readonly closeNote?: (args: ReadonlyArray<string>, text: string) => EngineReply; // answers `done` and `drop`
@@ -59,6 +62,7 @@ type FileTimes = { readonly mtimeMs: number; readonly size: number };
 type Stage = {
     readonly clock: MockClock;
     readonly registered: CommandSpec[];
+    readonly tools: RegisteredToolSpec[];
     readonly toasts: string[];
     readonly runs: string[][];
     readonly inits: (ProcessRunInit | undefined)[];
@@ -138,7 +142,7 @@ function drivePathOf(path: string): string {
 }
 
 // The world beneath the plugin: every call it makes is recorded and answered from `world`, and every event the
-// tests raise has a bottom. Defaults: the registration succeeds, the engine answers as engineReply does (ROWS for
+// tests raise has a bottom. Defaults: both registrations succeed, the engine answers as engineReply does (ROWS for
 // `rows`, LISTING for `list`, and it parks or closes by whatever text arrives on standard input), the transcript is
 // empty, the completion answers CLEAN, the fork has nothing to fork, the pane is placed, no pane is open, the draft
 // is empty, a fill succeeds, no variable is set, no file exists (a stat is refused) and the session runs in
@@ -148,6 +152,7 @@ function stage(on: On, world: World = {}): Stage {
     const recorded: Stage = {
         clock,
         registered: [],
+        tools: [],
         toasts: [],
         runs: [],
         inits: [],
@@ -174,6 +179,13 @@ function stage(on: On, world: World = {}): Stage {
         }
         recorded.registered.push(e);
         return { value: { command: e.name } };
+    });
+    on('tool.register', (_$, e) => {
+        if (world.toolRegister === 'deny') {
+            return { deny: 'refused by the test' };
+        }
+        recorded.tools.push(e);
+        return { value: { tool: `mcp__laterbox__${e.name}` } };
     });
     on('ui.toast', (_$, e) => {
         recorded.toasts.push(e.text);
@@ -1468,4 +1480,99 @@ test('session start does not wait for the search', OFF, async ($, on) => {
     answer.release(true);
     await Promise.all([started, run]);
     expect(world.runs[0]?.[0]).toBe(GIT_BASH);
+});
+
+// The tool the module registers, as the model calls it.
+const QUEUE_TOOL = 'mcp__laterbox__queue';
+
+test('session start registers the queue tool, not deferred', async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    expect(world.tools).toEqual([
+        { name: 'queue', description: TOOL_DESCRIPTION, inputSchema: TOOL_INPUT_SCHEMA, isDeferred: false },
+    ]);
+    expect(world.toasts).toEqual([]);
+});
+
+test('a session that is not interactive registers the queue tool too', async ($, on) => {
+    const world = stage(on);
+    await $.session.start(HEADLESS);
+    expect(world.tools.map((tool) => [tool.name, tool.isDeferred])).toEqual([['queue', false]]);
+});
+
+test('a refused tool registration shows a toast and the session still starts', async ($, on) => {
+    const world = stage(on, { toolRegister: 'deny' });
+    const result = await $.session.start(SESSION);
+    expect(result).toEqual({ cwd: SESSION.cwd });
+    expect(world.registered.map((command) => command.name)).toEqual(['later']);
+    expect(world.toasts).toHaveLength(1);
+    expect(world.toasts[0]).toStartWith('later: could not register the queue tool: ');
+    expect(world.toasts[0]).toContain('refused by the test');
+});
+
+// One call per action; each answers with the engine's output, its trailing newline trimmed.
+test('the tool lists, adds and closes through the engine', async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    const listed = await $.tool.call({ tool: QUEUE_TOOL, action: 'list' });
+    const added = await $.tool.call({ tool: QUEUE_TOOL, action: 'add', note: AT_FILE });
+    const done = await $.tool.call({ tool: QUEUE_TOOL, action: 'done', number: 1, text: CHECK });
+    const dropped = await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: 2, text: 'ends here  ' });
+    expect(engineRuns(world)).toEqual([
+        { args: ['list'] },
+        { args: ['add'], stdin: AT_FILE },
+        { args: ['done', '--if', '1'], stdin: CHECK },
+        { args: ['drop', '--if', '2'], stdin: 'ends here  ' },
+    ]);
+    expect(world.inits.map((init) => init?.env?.['LATER_INPUT'])).toEqual([undefined, 'stdin', 'stdin', 'stdin']);
+    expect(world.runs.every((argv) => argv[0]?.endsWith('/scripts/later.sh'))).toBe(true);
+    expect(listed).toEqual({ result: LISTING.trimEnd() });
+    expect(added).toEqual({ result: `later: parked -> ${AT_FILE}` });
+    expect(done).toEqual({ result: `later: done -> ${CHECK}` });
+    expect(dropped).toEqual({ result: 'later: dropped -> ends here' });
+});
+
+// Review focus 5: a number that is zero, negative, fractional or a string, or no text, runs nothing.
+test('an invalid tool input is refused without a run', async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    const close = "later: done and drop need a whole note number of 1 or more and the note's text";
+    const results = [
+        await $.tool.call({ tool: QUEUE_TOOL, action: 'done', number: 0, text: CHECK }),
+        await $.tool.call({ tool: QUEUE_TOOL, action: 'done', number: -1, text: CHECK }),
+        await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: 1.5, text: CHECK }),
+        await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: '2', text: CHECK }),
+        await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: 2 }),
+        await $.tool.call({ tool: QUEUE_TOOL, action: 'add', note: ' \t ' }),
+        await $.tool.call({ tool: QUEUE_TOOL, action: 'peek' }),
+    ];
+    expect(results).toEqual([
+        { deny: close },
+        { deny: close },
+        { deny: close },
+        { deny: close },
+        { deny: close },
+        { deny: 'later: add needs a note that is not empty' },
+        { deny: 'later: action must be list, add, done or drop' },
+    ]);
+    expect(world.runs).toEqual([]);
+});
+
+// The worked example of spec 3.2: another session closed note 1, so number 2 is no longer B and nothing is dropped.
+test('an engine failure reaches the model as a refusal', async ($, on) => {
+    const world = stage(on, {
+        engine: { exitCode: 1, stdout: '', stderr: 'later: note 2 changed since it was listed; nothing changed\n' },
+    });
+    await $.session.start(SESSION);
+    const dropped = await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: 2, text: 'B' });
+    expect(dropped).toEqual({ deny: 'later: note 2 changed since it was listed; nothing changed' });
+    expect(engineRuns(world)).toEqual([{ args: ['drop', '--if', '2'], stdin: 'B' }]);
+});
+
+test('with no bash found the tool refuses with the plain reason', async ($, on) => {
+    const world = stage(on, { env: { OS: 'Windows_NT' } });
+    await $.session.start(HEADLESS);
+    const listed = await $.tool.call({ tool: QUEUE_TOOL, action: 'list' });
+    expect(listed).toEqual({ deny: `later: ${NO_BASH_REASON}` });
+    expect(world.runs).toEqual([]);
 });
