@@ -15,6 +15,12 @@ which runs the plugin's queue engine; each call lists the queue or acts on one
 note. The tool finds the right queue from any subdirectory or worktree, so
 never build the queue's path yourself.
 
+When `mcp__laterbox__queue` is not among your tools (a deny rule the user
+wrote withholds it from the session), tell the user that the queue tool is not
+available in this session, and run the queue engine no other way: not through
+the terminal command `later`, and not by running the plugin's scripts. The
+user can still use `/later` and its pane themselves.
+
 Do exactly one of the following.
 
 ## The user wants to see the queue: list it
@@ -82,9 +88,10 @@ The engine is the only program that writes the queue: never edit it by hand.
 - At session start a hook shows the user a count line, and once a week the
   oldest notes. That message is for the user only and is not in your context.
   If the user refers to it, list the queue with `mcp__laterbox__queue`.
-- From a terminal the same engine is reached as `later`, `later <note>`,
-  `later done <n>`, `later drop <n>` and `later all`, through a link the
-  plugin's session-start hook keeps at `~/.local/bin/later`.
+- On Linux and macOS the user can also run the engine from their own
+  terminal: `later`, `later <note>`, `later done <n>`, `later drop <n>` and
+  `later all`. That command is for the user to type, not a way for you to
+  reach the queue.
 - The session-start message appears in terminal sessions only. Headless runs,
   the desktop app, IDE extensions and SDK-driven sessions are skipped, so they
   never use up the weekly list.
