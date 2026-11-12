@@ -4,6 +4,7 @@ import type {
     Elements,
     EngineInterface,
     ModelForkResult,
+    ProcessRunInit,
     Register,
     RenderElement,
     RenderInput,
@@ -13,9 +14,36 @@ import type {
     UiPane,
 } from 'claude-code';
 import type { NoteRow, Queue, Selection } from '../types/index';
+import type { BashVariables } from './bash';
+import { findBash, isWindowsHost, scriptPathOf } from './bash';
+import type { RunFailure } from './failure';
+import { failureKindOf, failureReason } from './failure';
+import type { FileLook, GateMemo } from './gate';
+import { needsRead } from './gate';
+import { engineCallOf, parseToolInput, TOOL_DESCRIPTION, TOOL_INPUT_SCHEMA } from './tool';
+
+// The queue tool's arguments as the model sent them. Declared here, the tool's name types the `tool.call` hook below
+// whatever MCP tools the type root lists (a root written while servers were connected lists theirs alone). Declared
+// loose, a call that breaks the schema still reaches parseToolInput, which refuses it with a reason.
+declare module 'claude-code' {
+    interface McpToolInputs {
+        mcp__laterbox__queue: Readonly<Record<string, unknown>>;
+    }
+}
 
 // The three ways a typed note is cleaned before it is stored: the `/config` row `laterbox.rewrite`.
 type RewriteMode = 'haiku' | 'fork' | 'off';
+
+// How this session starts the engine: by the script's own path (off Windows), through the Git for Windows bash the
+// search found, or not at all, since on Windows the search found none (spec R1, 4.1).
+type Launcher =
+    | { readonly kind: 'direct' }
+    | { readonly kind: 'bash'; readonly path: string }
+    | { readonly kind: 'missing' };
+
+// What every engine run is given: the queue file setting and the launcher, which the session's search settles
+// (spec 1.4).
+type EngineContext = { readonly queueFile: string; launcher: Promise<Launcher> };
 
 // What one run of the engine script came to: its standard output, or why it did not list or store.
 type EngineOutcome = { readonly ok: true; readonly stdout: string } | { readonly ok: false; readonly reason: string };
@@ -28,18 +56,31 @@ type Parked =
     | { readonly ok: true; readonly line: string; readonly stored: string }
     | { readonly ok: false; readonly line: string };
 
-// What the module knows of this session, in one object `register` creates: the queue file setting every engine run
-// is given, whether the session is interactive (only then does a bare run open the pane), whether the pane is open,
-// whether an action on a note is running, how many reads of the queue are in flight and how many have started, and
-// the refresh timer (C1).
+// What the module knows of this session, in one object `register` creates: the queue file setting and the launcher
+// every engine run is given (an EngineContext), whether the session is interactive (only then does a bare run open
+// the pane), whether the pane is open, whether an action on a note is running, how many reads of the queue are in
+// flight and how many have started, the refresh timer (C1), the memo of the read the pane shows (spec R2), undefined
+// until the pane has read, and whether a look at the queue file is still waiting on the file layer.
 type PaneSession = {
     readonly queueFile: string;
+    launcher: Promise<Launcher>;
     isInteractive: boolean;
     isPaneOpen: boolean;
     isActing: boolean;
     readsInFlight: number;
     readsStarted: number;
     refreshTimer: Timer;
+    gate: GateMemo | undefined;
+    isLooking: boolean;
+};
+
+// What the pane saw just before a read of the queue (spec 2.2): the session's working directory, the path the memo
+// named ('' while no read named one), the look at that file (undefined with no path), and the time.
+type QueueLook = {
+    readonly cwd: string;
+    readonly path: string;
+    readonly file: FileLook | undefined;
+    readonly nowMs: number;
 };
 
 const COMMAND_DESCRIPTION =
@@ -48,15 +89,27 @@ const COMMAND_DESCRIPTION =
 // The notes pane, one per session, drawn from the four values below.
 const PANE = 'later-notes';
 
-// How often the open pane reads the queue again (C1).
+// How often the open pane looks at the queue, and reads it when the gate says so (C1, spec R2).
 const REFRESH_MS = 5_000;
+
+// The status line of an action on a note refused because the session left the folder the list was read in (spec 2.4).
+const MOVED_LINE = 'later: the session moved to another folder; the list was read again';
+
+// How long a read waits for its look at the queue file. A local look answers in milliseconds; the file layer has no
+// timeout of its own, and a network mount that stops answering can hold a look forever. Two seconds is well past a
+// healthy look and well inside the 5-second tick, so a tick whose look gives up still starts its engine read in its
+// own period.
+const LOOK_TIMEOUT_MS = 2_000;
 
 // The refresh timer until a session start replaces it: stopping it does nothing.
 const NO_TIMER: Timer = { cancel: () => undefined };
 
-// Whether each surface's element table has an `Input`, checked against the declared tables. The table `$.ui.resolve`
-// hands out at run time holds every element name (an omitted one draws a fragment), so it cannot be asked.
-const TAKES_INPUT: { readonly [S in RenderSurface]: 'Input' extends keyof Elements[S] ? true : false } = {
+// Whether the pane draws an `Input` on each surface. The declared tables check it one way: `true` only where the
+// surface's table declares an `Input`, so `hasInput` narrows soundly; `false` is allowed on any surface and only
+// leaves out `add`. The table `$.ui.resolve` hands out at run time holds every element name (an omitted one draws a
+// fragment), so it cannot be asked. Mobile stays `false` on every host: the floor's (2.1.296) mobile table has no
+// `Input`, and where a later Claude Code's has one, a mobile app that did not ask to draw it gets an empty Box.
+const TAKES_INPUT: { readonly [S in RenderSurface]: 'Input' extends keyof Elements[S] ? boolean : false } = {
     terminal: true,
     desktop: true,
     mobile: false,
@@ -66,7 +119,7 @@ const TAKES_INPUT: { readonly [S in RenderSurface]: 'Input' extends keyof Elemen
 // The surfaces whose element table has an `Input`.
 type InputSurface = { [S in RenderSurface]: 'Input' extends keyof Elements[S] ? S : never }[RenderSurface];
 
-// Whether the pane is drawn where an `Input` can be (C15). Narrowed by it, `$.ui.resolve(e)` hands out one.
+// Whether the pane draws an `Input` on its surface (C15). Narrowed by it, `$.ui.resolve(e)` hands one out.
 function hasInput(e: RenderInput<'Pane'>): e is RenderInput<'Pane', InputSurface> {
     return TAKES_INPUT[e.surface];
 }
@@ -86,6 +139,13 @@ const NOTE_LINE = /^note\t(\d+)\t([^\t]*)\t(.*)$/s;
 
 // The default of the `/config` row `laterbox.file`, the queue file used when the option holds no string.
 const DEFAULT_QUEUE_FILE = 'LATER.local.md';
+
+// The reason every engine run gives on Windows when the search found no bash, and the line spec 4.1 shows once per
+// session: the reason under the plugin's name. The failure templates put `later: ` before the reason.
+const NO_BASH_REASON =
+    "Git for Windows' bash was not found. Install Git for Windows (https://git-scm.com/download/win) and restart " +
+    'Claude Code.';
+const NO_BASH_LINE = `laterbox: ${NO_BASH_REASON}`;
 
 const ENGINE_TIMEOUT_MS = 10_000;
 const COMPLETION_TIMEOUT_MS = 8_000;
@@ -261,32 +321,146 @@ function reasonOf(stderr: string, fallback: string): string {
     return line.startsWith('later: ') ? line.slice('later: '.length) : line;
 }
 
+// How an engine run is started. The queue file setting goes in the environment, over the inherited one: the engine
+// resolves the queue by it and stores it for the terminal command. User text, `input` (the note of an `add`, the
+// guard text of a `done` or `drop`), goes on standard input with `LATER_INPUT=stdin`, never as an argument, on every
+// platform (spec 1.8): Git for Windows' runtime rewrites the arguments a Windows program passes to bash, replacing
+// `@README.md` with that file's contents and globbing words such as `*.md` or `(the)`. A run without user text
+// gets neither.
+function engineInit(queueFile: string, input: string | undefined): ProcessRunInit {
+    if (input === undefined) {
+        return { timeoutMs: ENGINE_TIMEOUT_MS, env: { CLAUDE_PLUGIN_OPTION_FILE: queueFile } };
+    }
+    return {
+        timeoutMs: ENGINE_TIMEOUT_MS,
+        env: { CLAUDE_PLUGIN_OPTION_FILE: queueFile, LATER_INPUT: 'stdin' },
+        stdin: input,
+    };
+}
+
+// The variables the bash search reads (spec 1.6), each named by a literal: the directory reads the names a module
+// reads off its source and refuses a module whose names it cannot read. A variable that is unset, or whose read a
+// hook refuses, is left out: a refused `OS` leaves the host taken as not Windows, so the engine runs as before (spec
+// 1.1, R6), and on Windows a refused read skips only the step that needs it.
+async function readBashVariables($: EngineInterface): Promise<BashVariables> {
+    const values: ReadonlyArray<readonly [keyof BashVariables, string | undefined]> = [
+        ['OS', await $.env.get('OS').catch((): undefined => undefined)],
+        ['SHELL', await $.env.get('SHELL').catch((): undefined => undefined)],
+        ['CLAUDE_CODE_GIT_BASH_PATH', await $.env.get('CLAUDE_CODE_GIT_BASH_PATH').catch((): undefined => undefined)],
+        ['ProgramFiles', await $.env.get('ProgramFiles').catch((): undefined => undefined)],
+        ['ProgramW6432', await $.env.get('ProgramW6432').catch((): undefined => undefined)],
+        ['ProgramFiles(x86)', await $.env.get('ProgramFiles(x86)').catch((): undefined => undefined)],
+        ['LOCALAPPDATA', await $.env.get('LOCALAPPDATA').catch((): undefined => undefined)],
+        ['PATH', await $.env.get('PATH').catch((): undefined => undefined)],
+    ];
+    const variables: Partial<Record<keyof BashVariables, string>> = {};
+    for (const [name, value] of values) {
+        if (value !== undefined) {
+            variables[name] = value;
+        }
+    }
+    return variables;
+}
+
+// How this session starts the engine (spec 1.1 to 1.3): off Windows directly, as before; on Windows through the bash
+// the search finds, or not at all when it finds none.
+async function searchLauncher($: EngineInterface): Promise<Launcher> {
+    const variables = await readBashVariables($);
+    if (!isWindowsHost(variables)) {
+        return { kind: 'direct' };
+    }
+    const search = await findBash(variables, (path) => $.fs.exists(path));
+    return search.kind === 'found' ? { kind: 'bash', path: search.path } : { kind: 'missing' };
+}
+
+// The session's one search (spec 1.4) as the session keeps it: finding no bash shows the 4.1 line once. Its reads
+// and file checks already count a refusal as unset or absent, so a search that rejects all the same counts as one
+// that found none. The promise never rejects, so the engine runs that await it never throw there.
+async function sessionLauncher($: EngineInterface): Promise<Launcher> {
+    const launcher = await searchLauncher($).catch((): Launcher => ({ kind: 'missing' }));
+    if (launcher.kind === 'missing') {
+        try {
+            $.ui.toast(NO_BASH_LINE);
+        } catch {
+            // The engine runs give the same reason, so a toast that throws loses nothing they do not say.
+        }
+    }
+    return launcher;
+}
+
+// The argument vector of an engine run (spec 1.2): through the bash the search found, the script path in forward-slash
+// form after it, or the script alone, as before.
+function engineArgv(
+    launcher: Exclude<Launcher, { readonly kind: 'missing' }>,
+    root: string,
+    args: ReadonlyArray<string>,
+): ReadonlyArray<string> {
+    return launcher.kind === 'bash'
+        ? [launcher.path, scriptPathOf(root), ...args]
+        : [`${root}/scripts/later.sh`, ...args];
+}
+
 // Runs the engine by argument vector, no shell, in the session's working directory, so the queue resolves as it
-// does from a terminal. The queue file setting goes in the environment, over the inherited one: the engine resolves
-// the queue by it and stores it for the terminal command. A non-zero exit and a rejection (cannot start, timeout)
-// both become a reason. The standard output comes back exactly as the engine printed it.
+// does from a terminal, started as engineInit says. It first waits for the session's search; with no bash found it
+// starts nothing and gives the 4.1 reason. A non-zero exit and a rejection (cannot start, timeout) both become a
+// failed run, as failedRun reports it. The standard output comes back exactly as the engine printed it.
 async function runEngineRaw(
     $: EngineInterface,
-    queueFile: string,
+    context: EngineContext,
     args: ReadonlyArray<string>,
+    input?: string,
 ): Promise<EngineOutcome> {
+    const launcher = await context.launcher;
+    if (launcher.kind === 'missing') {
+        return { ok: false, reason: NO_BASH_REASON };
+    }
+    const argv = engineArgv(launcher, $.plugin.root, args);
+    let failure: RunFailure;
     try {
-        const result = await $.process.run([`${$.plugin.root}/scripts/later.sh`, ...args], {
-            timeoutMs: ENGINE_TIMEOUT_MS,
-            env: { CLAUDE_PLUGIN_OPTION_FILE: queueFile },
-        });
+        const result = await $.process.run(argv, engineInit(context.queueFile, input));
         if (result.exitCode === 0) {
             return { ok: true, stdout: result.stdout };
         }
-        return { ok: false, reason: reasonOf(result.stderr, `exit code ${result.exitCode}`) };
+        failure = { kind: 'exited', exitCode: result.exitCode, stderr: result.stderr };
     } catch (error: unknown) {
-        return { ok: false, reason: messageOf(error) };
+        failure = { kind: 'rejected', message: messageOf(error) };
     }
+    return failedRun($, failure, launcher.kind, argv[0] ?? '');
+}
+
+// A failed engine run as runEngineRaw reports it (spec 4.2): what the run said goes to the debug log alone, and the
+// reason is the plain one of its kind; `started` is the program the run started, the first argument. The engine's
+// own reason is today's: the first line of its stderr, else the exit code; a rejection is never of the engine's
+// kind, so its message only stands in.
+function failedRun(
+    $: EngineInterface,
+    failure: RunFailure,
+    launcher: 'direct' | 'bash',
+    started: string,
+): EngineOutcome {
+    debugLog($, `later: engine run failed: ${rawFailureOf(failure)}`);
+    const engineReason =
+        failure.kind === 'exited' ? reasonOf(failure.stderr, `exit code ${failure.exitCode}`) : failure.message;
+    return { ok: false, reason: failureReason(failureKindOf(failure, launcher), { started, engineReason }) };
+}
+
+// What a failed run said, for the debug log: the rejection's message, or the exit code and the standard error.
+function rawFailureOf(failure: RunFailure): string {
+    if (failure.kind === 'rejected') {
+        return failure.message;
+    }
+    const stderr = failure.stderr.trim();
+    return stderr === '' ? `exit code ${failure.exitCode}` : `exit code ${failure.exitCode}: ${stderr}`;
 }
 
 // As runEngineRaw, with trailing whitespace trimmed from the standard output, for output shown as a line.
-async function runEngine($: EngineInterface, queueFile: string, args: ReadonlyArray<string>): Promise<EngineOutcome> {
-    const outcome = await runEngineRaw($, queueFile, args);
+async function runEngine(
+    $: EngineInterface,
+    context: EngineContext,
+    args: ReadonlyArray<string>,
+    input?: string,
+): Promise<EngineOutcome> {
+    const outcome = await runEngineRaw($, context, args, input);
     return outcome.ok ? { ok: true, stdout: outcome.stdout.trimEnd() } : outcome;
 }
 
@@ -296,13 +470,15 @@ function noteKey(text: string, occurrence: number): string {
     return `note:${occurrence}:${text}`;
 }
 
-// The output of `later.sh rows`: a `queue\t<label>` line, then one note line per open note. A line that is not a
-// note line is skipped.
+// The output of `later.sh rows`: a `queue\t<label>\t<path>` line, then one note line per open note. The engine
+// turns a tab in the label into a space, so the label is the second field and the path is the rest, its own tabs
+// kept; a queue line without a path gives ''. A line that is not a note line is skipped.
 function parseRows(stdout: string): Queue {
     const [head = '', ...lines] = stdout.split('\n');
     if (!head.startsWith('queue\t')) {
         return { kind: 'failed', reason: 'the engine printed no queue line' };
     }
+    const [, label = '', ...pathFields] = head.split('\t');
     const notes = lines.flatMap((line): ReadonlyArray<Omit<NoteRow, 'key'>> => {
         const match = NOTE_LINE.exec(line);
         if (match === null) {
@@ -319,7 +495,7 @@ function parseRows(stdout: string): Queue {
             text: note.text,
         }),
     );
-    return { kind: 'read', label: head.slice('queue\t'.length), rows };
+    return { kind: 'read', label, path: pathFields.join('\t'), rows };
 }
 
 // The notes a queue holds; one that could not be read holds none.
@@ -365,20 +541,79 @@ function paneRows(queue: Queue): number {
 // Only the newline that ends the output is removed: the engine keeps a note's trailing spaces and tabs (it drops
 // only the carriage return that ends a CRLF line), and a guarded close must send the text exactly as the engine
 // holds it.
-async function readQueue($: EngineInterface, queueFile: string): Promise<Queue> {
-    const listed = await runEngineRaw($, queueFile, ['rows']);
+async function readQueue($: EngineInterface, context: EngineContext): Promise<Queue> {
+    const listed = await runEngineRaw($, context, ['rows']);
     if (!listed.ok) {
         return { kind: 'failed', reason: listed.reason };
     }
     return parseRows(listed.stdout.endsWith('\n') ? listed.stdout.slice(0, -1) : listed.stdout);
 }
 
-// Parks a typed note: the rewrite, then `add`. The line is what the command prints: the engine's line, followed by
-// ` (typed: <typed>)` when the rewrite changed the text, or the failure template, which keeps the typed text on
-// screen. The pane's add shows the same line.
-async function park($: EngineInterface, mode: RewriteMode, queueFile: string, typed: string): Promise<Parked> {
+// A look at the queue file, which starts no process (spec 2.2, 2.3): `exists` first, then `stat` when it exists. An
+// `exists` that rejects (a network location, which the file layer never touches) or a `stat` that rejects for a file
+// that exists (an access refusal) leaves the file unseeable, and the pane reads on every tick.
+async function lookAt($: EngineInterface, path: string): Promise<FileLook> {
+    const exists = await $.fs.exists(path).catch((): undefined => undefined);
+    if (exists === undefined) {
+        return { kind: 'unseeable' };
+    }
+    if (!exists) {
+        return { kind: 'absent' };
+    }
+    const stat = await $.fs.stat(path).catch((): undefined => undefined);
+    return stat === undefined ? { kind: 'unseeable' } : { kind: 'present', mtimeMs: stat.mtimeMs, size: stat.size };
+}
+
+// A look at the queue file that holds its caller no longer than LOOK_TIMEOUT_MS, one at a time. A look that does not
+// answer in time counts as unseeable (spec 2.3), so the pane reads through the engine, whose run has its own timeout
+// and reason (R4). While an earlier look still waits on the file layer, none other starts and the file counts as
+// unseeable, so at most one call waits there however long the file system hangs. The timer comes from
+// `$.clock.after`, whose wait does not count against the hook's budget as `$.clock.sleep` would.
+async function lookInTime($: EngineInterface, session: PaneSession, path: string): Promise<FileLook> {
+    if (session.isLooking) {
+        return { kind: 'unseeable' };
+    }
+    session.isLooking = true;
+    const looked = lookAt($, path).finally(() => {
+        session.isLooking = false;
+    });
+    const timedOut = deferred<FileLook>();
+    const timer = $.clock.after(LOOK_TIMEOUT_MS, () => timedOut.resolve({ kind: 'unseeable' }));
+    try {
+        return await Promise.race([looked, timedOut.promise]);
+    } finally {
+        timer.cancel();
+    }
+}
+
+// The look a read is gated on and remembered by, taken before the read so a write landing between the two costs one
+// more read instead of hiding until the minute (spec 2.2). The file looked at is the one `memo` names; a memo that
+// names none, or no memo, gives no look, and '' never reaches the file layer.
+async function lookBeforeRead(
+    $: EngineInterface,
+    session: PaneSession,
+    memo: GateMemo | undefined,
+): Promise<QueueLook> {
+    const cwd = await $.session.cwd();
+    const path = memo?.path ?? '';
+    const file = path === '' ? undefined : await lookInTime($, session, path);
+    return { cwd, path, file, nowMs: await $.clock.now() };
+}
+
+// The memo a read leaves: the folder and time of the look before it, the path the read named (the one looked at
+// when the read failed), and the look only when it was taken at that path. A read that names another file (the
+// first read, or one after a `cd`) leaves no look, so the next tick reads once more and takes one.
+function memoAfterRead(look: QueueLook, queue: Queue): GateMemo {
+    const path = queue.kind === 'read' ? queue.path : look.path;
+    return { cwd: look.cwd, path, file: path === look.path ? look.file : undefined, readAtMs: look.nowMs };
+}
+
+// Parks a typed note: the rewrite, then `add`, the note on standard input. The line is what the command prints: the
+// engine's line, followed by ` (typed: <typed>)` when the rewrite changed the text, or the failure template, which
+// keeps the typed text on screen. The pane's add shows the same line.
+async function park($: EngineInterface, mode: RewriteMode, context: EngineContext, typed: string): Promise<Parked> {
     const stored = await rewrite($, mode, typed);
-    const added = await runEngine($, queueFile, ['add', stored]);
+    const added = await runEngine($, context, ['add'], stored);
     if (!added.ok) {
         return { ok: false, line: `later: could not park the note (${added.reason}); typed: ${typed}` };
     }
@@ -387,8 +622,8 @@ async function park($: EngineInterface, mode: RewriteMode, queueFile: string, ty
 }
 
 // The list as a transcript row, with the hidden note that it holds reminders, not tasks.
-async function listQueue($: EngineInterface, queueFile: string): Promise<CommandRunResult> {
-    const listed = await runEngine($, queueFile, ['list']);
+async function listQueue($: EngineInterface, context: EngineContext): Promise<CommandRunResult> {
+    const listed = await runEngine($, context, ['list']);
     return listed.ok ? { text: listed.stdout, context: [LIST_NOTE] } : { text: `later: ${listed.reason}` };
 }
 
@@ -407,16 +642,19 @@ async function inFlight<T>(session: PaneSession, work: (isOvertaken: () => boole
 }
 
 // Reads the queue into state and opens the pane over it. Opened afresh, the pane selects the first note; opened
-// while open, it keeps the selection as a re-read does. An open another plugin refuses prints the list. So does one
-// that waits undrawn because no attached surface places panes, after closing it again: seated later, it would show
-// a queue nobody asked for at that moment.
+// while open, it keeps the selection as a re-read does. The read is looked at before and remembered as a refresh's
+// is, so the timer and the pane's actions judge against it. An open another plugin refuses prints the list. So does
+// one that waits undrawn because no attached surface places panes, after closing it again: seated later, it would
+// show a queue nobody asked for at that moment.
 async function openPane($: EngineInterface, session: PaneSession): Promise<CommandRunResult> {
     const queue = await inFlight(session, async () => {
-        const listed = await readQueue($, session.queueFile);
+        const look = await lookBeforeRead($, session, session.gate);
+        const listed = await readQueue($, session);
         const selected = session.isPaneOpen
             ? reselect(await read($, queueState), listed, await read($, selectedState))
             : firstSelection(listed);
         await update($, queueState, () => listed);
+        session.gate = memoAfterRead(look, listed);
         await update($, selectedState, () => selected);
         await update($, addingState, () => false);
         await update($, statusState, () => '');
@@ -426,12 +664,12 @@ async function openPane($: EngineInterface, session: PaneSession): Promise<Comma
         .open({ id: PANE, title: 'Parked notes', focus: true, closeOnEscape: true, rows: paneRows(queue) })
         .catch((): undefined => undefined);
     if (opened === undefined) {
-        return listQueue($, session.queueFile);
+        return listQueue($, session);
     }
     if (!opened.isPlaced) {
         session.isPaneOpen = false;
         await $.ui.close({ id: PANE }).catch((): undefined => undefined);
-        return listQueue($, session.queueFile);
+        return listQueue($, session);
     }
     session.isPaneOpen = true;
     return {};
@@ -449,15 +687,21 @@ async function ringToRow($: EngineInterface, key: string): Promise<void> {
 }
 
 // Reads the queue again. When it changed, stores it and moves the selection by the rule of a re-read; a selection
-// that moved to another note takes the ring with it (C3) unless an input holds it. A read overtaken by one that
-// started after it writes nothing: a tick that read before a `d` would otherwise put the closed note back. The check
-// runs once, before the two writes; a read that started and settled between them would still be written over, which
-// takes an engine run faster than a state write. `closedKey` names the note a `d` or `x` of the pane just closed.
-async function refresh($: EngineInterface, session: PaneSession, closedKey?: string): Promise<void> {
+// that moved to another note takes the ring with it (C3) unless an input holds it. The memo is written with the
+// queue it describes, or alone when the queue is unchanged, from the look taken before the read: the tick's `look`,
+// else one taken here. A read overtaken by one that started after it writes nothing, its memo included: a tick that
+// read before a `d` would otherwise put the closed note back. The check runs once, before the writes; a read that
+// started and settled between them would still be written over, which takes an engine run faster than a state
+// write. `closedKey` names the note a `d` or `x` of the pane just closed.
+async function refresh($: EngineInterface, session: PaneSession, closedKey?: string, look?: QueueLook): Promise<void> {
     await inFlight(session, async (isOvertaken) => {
-        const queue = await readQueue($, session.queueFile);
+        const seen = look ?? (await lookBeforeRead($, session, session.gate));
+        const queue = await readQueue($, session);
         const before = await read($, queueState);
         if (JSON.stringify(queue) === JSON.stringify(before)) {
+            if (!isOvertaken()) {
+                session.gate = memoAfterRead(seen, queue);
+            }
             return;
         }
         const selected = await read($, selectedState);
@@ -466,6 +710,7 @@ async function refresh($: EngineInterface, session: PaneSession, closedKey?: str
         }
         const reselected = reselect(before, queue, selected, closedKey);
         await update($, queueState, () => queue);
+        session.gate = memoAfterRead(seen, queue);
         await update($, selectedState, () => reselected);
         if (reselected.kind === 'note' && (selected.kind === 'none' || selected.key !== reselected.key)) {
             await ringToRow($, reselected.key);
@@ -473,15 +718,25 @@ async function refresh($: EngineInterface, session: PaneSession, closedKey?: str
     });
 }
 
-// One period of the refresh timer (C1). It reads only while the pane is open and no read is in flight, so a slow
-// engine never stacks reads. Nothing awaits a tick, so a failure goes to the debug log and the next period reads
-// again. An engine failure never gets here: it becomes the pane's header.
+// One period of the refresh timer (C1). It takes the session's folder and looks at the queue file, which starts no
+// process, and runs `rows` only when the gate says the queue may have changed (spec 2.2). It runs only while the pane
+// is open, no read is in flight and no earlier look still waits on the file layer, so neither a slow engine nor a
+// hung file system stacks work. The open pane and the reads in flight are checked again after the look, which a close
+// or another read can overtake, and the read then starts in the same step as the check; a look that gave up still
+// waits on the file layer, so it is not checked again. The look is judged against the memo it was taken for: a read
+// that settled meanwhile left a newer one, whose list is at least as fresh. Nothing awaits a tick, so a failure goes
+// to the debug log and the next period tries again. An engine failure never gets here: it becomes the pane's header.
 async function tick($: EngineInterface, session: PaneSession): Promise<void> {
-    if (!session.isPaneOpen || session.readsInFlight > 0) {
+    if (!session.isPaneOpen || session.readsInFlight > 0 || session.isLooking) {
         return;
     }
     try {
-        await refresh($, session);
+        const memo = session.gate;
+        const look = await lookBeforeRead($, session, memo);
+        if (!session.isPaneOpen || session.readsInFlight > 0 || !needsRead(memo, look.cwd, look.file, look.nowMs)) {
+            return;
+        }
+        await refresh($, session, undefined, look);
     } catch (error: unknown) {
         debugLog($, `later: the pane could not read the queue: ${messageOf(error)}`);
     }
@@ -528,9 +783,24 @@ async function appendToDraft($: EngineInterface, text: string): Promise<Filled> 
     }
 }
 
-// `w`, or Enter on a row: the note goes into the prompt box and the pane closes. A box that does not take it keeps
-// the pane open, and the status line says why.
+// Before an action on a note (spec 2.4): when the session's working directory is not the one the list on screen was
+// read in, the list is read again, the status line says so, and the action is not taken, so a list of one project
+// never acts on another. A pane with no memo has no folder to compare, which counts as moved.
+async function readAgainIfMoved($: EngineInterface, session: PaneSession): Promise<boolean> {
+    if ((await $.session.cwd()) === session.gate?.cwd) {
+        return false;
+    }
+    await refresh($, session);
+    await update($, statusState, () => MOVED_LINE);
+    return true;
+}
+
+// `w`, or Enter on a row: the note goes into the prompt box and the pane closes, unless the session moved to another
+// folder. A box that does not take it keeps the pane open, and the status line says why.
 async function workOnNote($: EngineInterface, session: PaneSession, row: NoteRow): Promise<void> {
+    if (await readAgainIfMoved($, session)) {
+        return;
+    }
     const filled = await appendToDraft($, row.text);
     if (filled.ok) {
         await closePane($, session);
@@ -564,15 +834,19 @@ async function workOnSelected($: EngineInterface, session: PaneSession): Promise
 }
 
 // `d` and `x`: closes the selected note, guarded by the text and number the pane drew, so a queue that changed
-// since the read is refused instead of losing another note. The text goes exactly as the read parsed it: a trimmed
-// copy would not match a note that ends in whitespace. The queue is read again either way, after a close with the
-// closed note named, so the selection moves on to the row now at its place even when a twin of it is still listed.
+// since the read is refused instead of losing another note; a session that moved to another folder closes nothing.
+// The text goes on standard input exactly as the read parsed it: a trimmed copy would not match a note that ends in
+// whitespace. The queue is read again either way, after a close with the closed note named, so the selection moves
+// on to the row now at its place even when a twin of it is still listed.
 async function closeSelected($: EngineInterface, session: PaneSession, mode: 'done' | 'drop'): Promise<void> {
+    if (await readAgainIfMoved($, session)) {
+        return;
+    }
     const row = await selectedRow($);
     if (row === undefined) {
         return;
     }
-    const closed = await runEngine($, session.queueFile, [mode, '--if', row.text, String(row.position)]);
+    const closed = await runEngine($, session, [mode, '--if', String(row.position)], row.text);
     const line = closed.ok ? closed.stdout : `later: ${closed.reason}`;
     await update($, statusState, () => line);
     await refresh($, session, closed.ok ? row.key : undefined);
@@ -624,7 +898,7 @@ async function submitNote($: EngineInterface, session: PaneSession, mode: Rewrit
         return;
     }
     await update($, statusState, () => 'later: parking...');
-    const parked = await park($, mode, session.queueFile, typed);
+    const parked = await park($, mode, session, typed);
     await update($, statusState, () => parked.line);
     await refresh($, session);
 }
@@ -750,18 +1024,25 @@ export const register: Register = (on, options) => {
     const mode = rewriteModeOf(options['rewrite']);
     const session: PaneSession = {
         queueFile: queueFileOf(options['file']),
+        launcher: Promise.resolve({ kind: 'direct' }),
         isInteractive: false,
         isPaneOpen: false,
         isActing: false,
         readsInFlight: 0,
         readsStarted: 0,
         refreshTimer: NO_TIMER,
+        gate: undefined,
+        isLooking: false,
     };
 
     // The name is taken while a user-level skill or command named `later` exists; the toast says so and the rest of
     // the plugin (the skill, the session-start hook) works. A reload registers the name again, which replaces the
     // earlier one.
     on('session.start', async ($, e, next) => {
+        // The bash search runs once per session (spec 1.4) and is not awaited: a slow file system never delays the
+        // start, and every engine run waits for its result. It is stored first, so nothing that runs after this start
+        // sees an earlier start's launcher.
+        session.launcher = sessionLauncher($);
         session.isInteractive = e.isInteractive;
         try {
             await $.command.register({
@@ -772,6 +1053,18 @@ export const register: Register = (on, options) => {
             });
         } catch (error: unknown) {
             $.ui.toast(`later: could not register /later: ${messageOf(error)}`);
+        }
+        // The tool the skill reaches the engine through (spec 3.1), in every session, interactive or not, and listed
+        // in the prompt rather than behind ToolSearch. A refusal leaves /later and the pane working.
+        try {
+            await $.tool.register({
+                name: 'queue',
+                description: TOOL_DESCRIPTION,
+                inputSchema: TOOL_INPUT_SCHEMA,
+                isDeferred: false,
+            });
+        } catch (error: unknown) {
+            $.ui.toast(`later: could not register the queue tool: ${messageOf(error)}`);
         }
         // One refresh timer per session (C1). A reload drops the module with its timer and starts here again, and the
         // engine's record says whether the pane stayed up; a record that cannot be read counts it as closed. A timer
@@ -792,10 +1085,25 @@ export const register: Register = (on, options) => {
     on('command.run', { command: 'later' }, async ($, e) => {
         const typed = collapse(e.args);
         if (typed === '') {
-            return session.isInteractive ? openPane($, session) : listQueue($, session.queueFile);
+            return session.isInteractive ? openPane($, session) : listQueue($, session);
         }
-        const parked = await park($, mode, session.queueFile, typed);
+        const parked = await park($, mode, session, typed);
         return parked.ok ? { text: parked.line, context: [parkedNote(parked.stored)] } : { text: parked.line };
+    });
+
+    // The queue tool (spec 3.1, 3.2). Its own arguments are checked first, and an invalid call is refused without a
+    // run. A valid one runs the engine as `/later` does, user text on standard input; a `done` or `drop` is guarded
+    // by the note's text, so a queue that changed since the model's listing refuses it and changes nothing. The
+    // engine's output is the result, and any failure reaches the model as a refusal. The tool is the module's own:
+    // a call no hook answers fails, so next is never called. The module answers no `tool.check` for it (spec 3.5).
+    on('tool.call', { tool: 'mcp__laterbox__queue' }, async ($, e) => {
+        const parsed = parseToolInput(e);
+        if (!parsed.ok) {
+            return { deny: `later: ${parsed.reason}` };
+        }
+        const { args, input } = engineCallOf(parsed.request);
+        const ran = await runEngine($, session, args, input);
+        return ran.ok ? { result: ran.stdout } : { deny: `later: ${ran.reason}` };
     });
 
     on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => drawPane($, e, session, mode));

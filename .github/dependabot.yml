@@ -1,0 +1,9 @@
+# The workflows pin each action by commit hash, with the release in a
+# comment. Dependabot opens a pull request when a pinned action has a
+# newer release, moving the hash and the comment together.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

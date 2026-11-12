@@ -4,8 +4,10 @@
 #
 #   add <note>       append a stamped note to the project's queue file
 #   list             print the open notes, numbered, with their age
-#   rows             a tab-separated listing for programs: "queue\t<label>",
-#                    then "note\t<n>\t<age>\t<text>" per open note
+#   rows             a tab-separated listing for programs:
+#                    "queue\t<label>\t<path>", <path> being the queue file's
+#                    absolute path, then "note\t<n>\t<age>\t<text>" per open
+#                    note
 #   done <n>...      tick the listed notes to [x]
 #   drop <n>...      delete the listed notes
 #   done|drop --if <text> <n>
@@ -15,6 +17,15 @@
 #   session-start    SessionStart hook entry point: a user-visible count line,
 #                    plus the oldest notes once per LATER_DIGEST_DAYS, and
 #                    the terminal command kept linked in ~/.local/bin
+#
+# LATER_INPUT=stdin moves the user's text from the arguments to standard
+# input, read whole and byte for byte: add takes no argument and parks the
+# input, and done|drop --if <n> takes one number and compares the input as
+# <text>. Git for Windows' runtime rewrites the arguments a native Windows
+# program passes to bash (an @file word becomes that file's contents, a word
+# holding a glob character is globbed), so the plugin's own callers set it.
+# The terminal command never does; any other value, or none, keeps the
+# argument forms.
 #
 # The queue file is LATER.local.md at the project's root, unless the
 # laterbox.file setting names another file (see resolve_queue_name).
@@ -26,6 +37,20 @@
 # A CDPATH from the environment would send a cd below to another folder, and
 # make it print that folder.
 unset CDPATH
+
+# Under Git Bash, whatever started it, Git's /usr/bin comes before Windows'
+# system folders on PATH, so Windows' own find.exe and sort.exe in System32
+# never stand in for Git's find and sort (spec 1.7). Bash sets OSTYPE to
+# msys there (cygwin in its kin), so the test starts no process. A PATH that
+# begins with /usr/bin, or with /mingw64/bin then /usr/bin as Git's launcher
+# sets it, is kept as it is. Before any line that starts a program.
+case ${OSTYPE:-} in
+    msys*|cygwin*)
+        case $PATH in
+            /usr/bin:*|/mingw64/bin:/usr/bin:*) ;;
+            *) PATH=/usr/bin:$PATH ;;
+        esac ;;
+esac
 
 DEFAULT_QUEUE_NAME='LATER.local.md'
 # The queue file's name for this run, set by resolve_queue_name.
@@ -509,7 +534,15 @@ append_note() {
 
 cmd_add() {
     local note file
-    note=$(printf '%s' "$*" | tr '\n\r\t' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
+    if [ "${LATER_INPUT:-}" = stdin ]; then
+        [ $# -eq 0 ] || { echo 'later: add takes its note from standard input here' >&2; return 1; }
+        # The whole input, by the read builtin: no process. read fails at the
+        # end of the input, which is where it stops.
+        IFS= read -r -d '' note
+    else
+        note="$*"
+    fi
+    note=$(printf '%s' "$note" | tr '\n\r\t' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
     if [ -z "$note" ]; then
         echo 'later: nothing to park (empty note)'
         return 0
@@ -532,13 +565,28 @@ cmd_list() {
     printf '%s\n' "$rows" | numbered
 }
 
-# The open notes for programs: "queue\t<label>", then one
+# The open notes for programs: "queue\t<label>\t<path>", then one
 # "note\t<position>\t<age>\t<text>" per open note. The text runs to the end
 # of the line and may hold tabs. No queue file: the queue line alone.
+# A tab in the label becomes a space, so the path is always the third field.
+# The path is the queue file's absolute path, printed whether or not the
+# file exists, for the pane to watch through the module's file layer (spec
+# 2.1): as queue_file spells it on Linux and macOS; under Git Bash in the
+# Windows form with forward slashes (C:/Users/x/proj/LATER.local.md), which
+# pwd -W in the queue's folder gives, so that every folder Git Bash can name
+# converts (other drives, network shares, /tmp). That costs one subshell,
+# whatever the queue's size. A drive root's trailing slash is dropped; a
+# folder pwd -W cannot give leaves the path as queue_file spells it.
 cmd_rows() {
-    local file i n mins text
+    local file label path dir tab=$'\t' i n mins text
     file=$(queue_file "$PWD") || { echo 'later: cannot resolve the queue here' >&2; return 1; }
-    printf 'queue\t%s\n' "$(queue_label "$file")"
+    label=$(queue_label "$file")
+    label=${label//"$tab"/ }
+    path=$file
+    case ${OSTYPE:-} in
+        msys*|cygwin*) dir=$(cd -- "${file%/*}" && pwd -W) && path=${dir%/}/${file##*/} ;;
+    esac
+    printf 'queue\t%s\t%s\n' "$label" "$path"
     while IFS=$'\t' read -r i n mins text; do
         age_label "$mins"
         printf 'note\t%s\t%s\t%s\n' "$i" "$REPLY" "$text"
@@ -624,9 +672,15 @@ close_notes() {
 }
 
 cmd_close() {
-    local mode="$1" file; shift
+    local mode="$1" file expect; shift
     [ $# -gt 0 ] || { echo "later: $mode needs at least one note number" >&2; return 1; }
-    if [ "$1" = '--if' ] && [ $# -ne 3 ]; then
+    if [ "$1" = '--if' ] && [ "${LATER_INPUT:-}" = stdin ]; then
+        [ $# -eq 2 ] || { echo 'later: --if takes exactly one note number' >&2; return 1; }
+        # The text is the whole input, untrimmed, read before the lock is
+        # taken; close_notes then sees the argument form --if <text> <n>.
+        IFS= read -r -d '' expect
+        set -- --if "$expect" "$2"
+    elif [ "$1" = '--if' ] && [ $# -ne 3 ]; then
         echo 'later: --if takes exactly one note number' >&2
         return 1
     fi

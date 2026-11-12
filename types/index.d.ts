@@ -4,9 +4,10 @@
 // notes with the same text, so it does not change with the note's number or age.
 export type NoteRow = { readonly key: string; readonly position: number; readonly age: string; readonly text: string };
 
-// The queue as the last `rows` read it, or why it could not be read.
+// The queue as the last `rows` read it, or why it could not be read. The path is the queue file's absolute path as
+// the engine printed it, '' when its queue line named none.
 export type Queue =
-    | { readonly kind: 'read'; readonly label: string; readonly rows: ReadonlyArray<NoteRow> }
+    | { readonly kind: 'read'; readonly label: string; readonly path: string; readonly rows: ReadonlyArray<NoteRow> }
     | { readonly kind: 'failed'; readonly reason: string };
 
 // The note the pane's keys act on, by its key, or none.
