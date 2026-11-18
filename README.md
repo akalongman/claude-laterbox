@@ -117,14 +117,14 @@ session-start message says once when the session's `PATH` lacks it.
 From a terminal:
 
 ```bash
-claude plugin marketplace add akalongman/claude-laterbox
+claude plugin marketplace add akalongman/claude-plugins
 claude plugin install laterbox@akalongman
 ```
 
 or inside a session:
 
 ```
-/plugin marketplace add akalongman/claude-laterbox
+/plugin marketplace add akalongman/claude-plugins
 /plugin install laterbox@akalongman
 ```
 
