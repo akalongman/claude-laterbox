@@ -120,7 +120,7 @@ usable_queue_name() {
 #      session-start reads its absence as the default; a cleared option is
 #      stored and passed as the empty string, so an empty value is the
 #      default too, for the hook and the module alike;
-#   2. the stored copy, for the terminal command and the skill's calls;
+#   2. the stored copy, for the terminal command;
 #   3. the default.
 # A name from 1 replaces the copy when the copy holds anything else. An
 # unusable value is never used or stored; the next source decides.
@@ -944,7 +944,9 @@ is_own_link() { # link bin
 # and PATH notices print when their condition starts, not while it lasts.
 terminal_link() {
     [ -n "${CLAUDE_PLUGIN_DATA:-}" ] || return 0
-    case "$(uname -s)" in Linux|Darwin) ;; *) return 0 ;; esac
+    # Linux and macOS only, told by OSTYPE, which bash sets, so the test
+    # starts no process.
+    case ${OSTYPE:-} in linux*|darwin*) ;; *) return 0 ;; esac
     local root data user tmp link path_state state seen_link='' seen_path=''
     # The script's own resolved location, never the plugin root variable of
     # the environment, which a hook of another plugin can inherit. Its folder

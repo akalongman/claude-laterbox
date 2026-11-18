@@ -1205,6 +1205,21 @@ else
     assert_eq "$(cat "$h"/out.* | grep -c 'added the terminal command')" "1" "four sessions starting at once announce the link once"
     assert_eq "$(readlink "$h/.local/bin/later")" "$h/data/bin/later" "and leave one own link"
     assert_eq "$(find "$h/data/bin" -name '.later.tmp.*' | count_lines)" "0" "and no temporary link"
+
+    # The step reads the platform from OSTYPE, which bash sets, so it starts
+    # no uname: this folder's uname records each call and runs the real one,
+    # first on the engine's PATH for this start alone. An OSTYPE that is
+    # neither Linux's nor macOS's links nothing.
+    UNAME_TRAP="$(mk_tmpdir)"
+    type -P uname > "$UNAME_TRAP/real"
+    printf '%s\n' '#!/bin/sh' 'd=${0%/*}' 'printf "%s\n" "$*" >> "$d/calls"' 'read -r real < "$d/real"' 'exec "$real" "$@"' > "$UNAME_TRAP/uname"
+    chmod +x "$UNAME_TRAP/uname"
+    h="$(mk_home)"
+    assert_eq "$(sl "$h" PATH="$UNAME_TRAP:$h/.local/bin:$ENGINE_PATH")" "$ADDED" "the uname trap: the links are made"
+    assert_nofile "$UNAME_TRAP/calls" "the uname trap: the link step starts no uname"
+    h="$(mk_home)"
+    assert_eq "$(sl "$h" OSTYPE=freebsd14.0)" "" "an OSTYPE that is neither Linux's nor macOS's: nothing announced"
+    assert_ok "an OSTYPE that is neither Linux's nor macOS's links nothing" untouched "$h"
 fi
 
 # --- terminal front-end -----------------------------------------------
