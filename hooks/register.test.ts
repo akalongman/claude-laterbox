@@ -1460,6 +1460,26 @@ test('no bash: one toast and a plain reason everywhere', OFF, async ($, on) => {
     expect(world.runs).toEqual([]);
 });
 
+// With no bash found nothing can store the note, so no model is asked to clean it first: the refusal costs no model
+// call and, in fork mode, no wait of up to 40 seconds.
+test('no bash: a typed note is refused before the small model is asked', async ($, on) => {
+    const world = stage(on, { env: { OS: 'Windows_NT' } });
+    await $.session.start(HEADLESS);
+    const parked = await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
+    expect(parked).toEqual({ text: `later: could not park the note (${NO_BASH_REASON}); typed: ${TYPED}` });
+    expect(world.completions).toEqual([]);
+    expect(world.forks).toEqual([]);
+});
+
+test('no bash: a typed note is refused before the session is forked', FORK, async ($, on) => {
+    const world = stage(on, { env: { OS: 'Windows_NT' } });
+    await $.session.start(HEADLESS);
+    const parked = await $.command.run({ command: 'later', args: TYPED, ...AT_PROMPT });
+    expect(parked).toEqual({ text: `later: could not park the note (${NO_BASH_REASON}); typed: ${TYPED}` });
+    expect(world.forks).toEqual([]);
+    expect(world.completions).toEqual([]);
+});
+
 // Every read refused, `OS` among them: the host is not taken as Windows, so the engine runs as before (spec 1.1, R6).
 test('refused variable reads leave the engine running directly', OFF, async ($, on) => {
     const world = stage(on, { isEnvRefused: () => true });

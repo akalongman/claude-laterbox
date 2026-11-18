@@ -610,15 +610,25 @@ function memoAfterRead(look: QueueLook, queue: Queue): GateMemo {
 
 // Parks a typed note: the rewrite, then `add`, the note on standard input. The line is what the command prints: the
 // engine's line, followed by ` (typed: <typed>)` when the rewrite changed the text, or the failure template, which
-// keeps the typed text on screen. The pane's add shows the same line.
+// keeps the typed text on screen. The pane's add shows the same line. With no bash found (spec 4.1) nothing can
+// store the note, so it is refused before the rewrite, which would be a model call, or a wait of up to 40 seconds
+// in fork mode, for nothing.
 async function park($: EngineInterface, mode: RewriteMode, context: EngineContext, typed: string): Promise<Parked> {
+    if ((await context.launcher).kind === 'missing') {
+        return { ok: false, line: notParkedLine(NO_BASH_REASON, typed) };
+    }
     const stored = await rewrite($, mode, typed);
     const added = await runEngine($, context, ['add'], stored);
     if (!added.ok) {
-        return { ok: false, line: `later: could not park the note (${added.reason}); typed: ${typed}` };
+        return { ok: false, line: notParkedLine(added.reason, typed) };
     }
     const suffix = stored === typed ? '' : ` (typed: ${typed})`;
     return { ok: true, line: `${added.stdout}${suffix}`, stored };
+}
+
+// The failure template of a typed note that was not stored, with the reason and the typed text.
+function notParkedLine(reason: string, typed: string): string {
+    return `later: could not park the note (${reason}); typed: ${typed}`;
 }
 
 // The list as a transcript row, with the hidden note that it holds reminders, not tasks.
