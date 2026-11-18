@@ -343,12 +343,24 @@ mkdir -p "$(lock_of "$young")"
 occupied="$(mk_repo)"; : > "$(lock_of "$occupied")"
 mac="$(mk_repo)"; lt "$mac" add before the holder >/dev/null
 mkdir -p "$(lock_of "$mac")"; printf '%s\n' "$$" > "$(lock_of "$mac")/pid"
+# A mkdir that reports success on a folder that already exists, as uutils
+# coreutils 0.10.0 does when another process made the folder between its own
+# check and its mkdir call: the holder's id, not mkdir's status, decides.
+UU_MKDIR="$(mk_tmpdir)"
+( PATH="$ENGINE_PATH"; type -P mkdir ) > "$UU_MKDIR/real"
+printf '%s\n' '#!/bin/sh' 'd=${0%/*}' 'for a; do last=$a; done' '[ -d "$last" ] && exit 0' \
+    'read -r real < "$d/real" && exec "$real" "$@"' 'exit 1' > "$UU_MKDIR/mkdir"
+chmod +x "$UU_MKDIR/mkdir"
+uu="$(mk_repo)"; lt "$uu" add before the holder >/dev/null
+mkdir -p "$(lock_of "$uu")"; printf '%s\n' "$$" > "$(lock_of "$uu")/pid"
 held_before="$(file_digest "$held/$Q")"; young_before="$(file_digest "$young/$Q")"; mac_before="$(file_digest "$mac/$Q")"
+uu_before="$(file_digest "$uu/$Q")"
 res="$(mk_tmpdir)"
 LATER_NO_FLOCK=1 timed_add "$held" refused > "$res/held" &
 LATER_NO_FLOCK=1 timed_add "$young" refused > "$res/young" &
 LATER_NO_FLOCK=1 timed_add "$occupied" "past a file" > "$res/occupied" &
 OSTYPE=darwin23 timed_add "$mac" refused > "$res/mac" &
+ENGINE_PATH="$UU_MKDIR:$ENGINE_PATH" LATER_NO_FLOCK=1 timed_add "$uu" refused > "$res/uu" &
 wait
 read -r status secs < "$res/held"
 assert_eq "$(sed 1d "$res/held")" "$LOCKED" "no flock: a live holder's lock refuses the writer"
@@ -369,7 +381,11 @@ read -r status secs < "$res/mac"
 assert_eq "$(sed 1d "$res/mac")$status" "${LOCKED}1" "off Linux: a held folder refuses the writer, also with flock on the PATH"
 assert_eq "$(file_digest "$mac/$Q")" "$mac_before" "off Linux: the refused writer leaves the queue byte-identical"
 assert_eq "$(cat "$(lock_of "$mac")/pid" 2>/dev/null)" "$$" "off Linux: the refused writer leaves the holder's folder and id in place"
-rm -rf "$(lock_of "$held")" "$(lock_of "$young")" "$(lock_of "$occupied")" "$(lock_of "$mac")"
+read -r status secs < "$res/uu"
+assert_eq "$(sed 1d "$res/uu")$status" "${LOCKED}1" "no flock: a mkdir that reports success on a held folder does not take the lock"
+assert_eq "$(file_digest "$uu/$Q")" "$uu_before" "no flock: past such a mkdir the queue is byte-identical"
+assert_eq "$(cat "$(lock_of "$uu")/pid" 2>/dev/null)" "$$" "no flock: past such a mkdir the holder's folder and id stay"
+rm -rf "$(lock_of "$held")" "$(lock_of "$young")" "$(lock_of "$occupied")" "$(lock_of "$mac")" "$(lock_of "$uu")"
 
 # The counterpart: on Linux with a flock that takes -w on the PATH, flock is
 # the lock, and a held folder does not stop the writer.

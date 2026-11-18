@@ -452,10 +452,29 @@ with_lock() {
     fi
 }
 
-# The lock off Linux, and on Linux without flock -w: the folder <lock>, which
-# mkdir makes or refuses in one step on every platform. The holder writes its
-# process id into it, runs the command and removes it, whatever the
-# command's status; a killed holder leaves it behind under a dead id. A
+# Takes the lock folder <lock>: makes it, then writes this writer's process id
+# into it with noclobber, which bash opens with O_EXCL, so one writer's id
+# lands and every other writer's is refused. mkdir's status alone does not
+# decide: uutils coreutils 0.10.0 (Ubuntu 26.04) reports success on a folder
+# another process made between its own check and its mkdir call. A writer
+# whose id did not land removes the folder only when it is empty, which
+# another writer's id prevents, so a full disk leaves no folder behind.
+take_lock_dir() { # lock
+    local written
+    mkdir "$1" 2>/dev/null || return 1
+    set -C
+    { printf '%s\n' "$$" > "$1/pid"; } 2>/dev/null
+    written=$?
+    set +C
+    [ "$written" -eq 0 ] && return 0
+    rmdir "$1" 2>/dev/null
+    return 1
+}
+
+# The lock off Linux, and on Linux without flock -w: the folder <lock> that
+# take_lock_dir makes, holding the holder's process id. The holder runs the
+# command and removes the folder, whatever the command's status; a killed
+# holder leaves it behind under a dead id. A
 # waiter tries every 0.1 seconds for at most 5 seconds, then refuses. It
 # breaks the folder at once when the id names no live process, and when the
 # folder is old enough that no writer holds it so long (the id was reused by
@@ -477,7 +496,7 @@ with_lock() {
 with_lock_dir() { # lock command...
     local lock="$1" start=$SECONDS tries=0 seen='' aged_at='' pid status
     shift
-    while ! mkdir "$lock" 2>/dev/null; do
+    while ! take_lock_dir "$lock"; do
         if [ -d "$lock" ]; then
             seen=1
             pid=''
@@ -509,17 +528,15 @@ with_lock_dir() { # lock command...
         fi
         sleep 0.1
     done
-    { printf '%s\n' "$$" > "$lock/pid"; } 2>/dev/null
     "$@"
     status=$?
-    # Removed while it holds this writer's id, or none (the write failed, a
-    # full disk). A folder naming another id was broken while the command
-    # ran (held past the age limit above, a suspended machine) and is another
-    # writer's now; a new holder that has not written its id yet still looks
-    # like none.
+    # Removed while it holds this writer's id, which take_lock_dir wrote. A
+    # folder naming another id, or none, was broken while the command ran
+    # (held past the age limit above, a suspended machine) and is another
+    # writer's now, one with no id yet between its mkdir and its id.
     pid=''
     { read -r pid < "$lock/pid"; } 2>/dev/null
-    case $pid in ''|"$$") rm -rf "$lock" ;; esac
+    case $pid in "$$") rm -rf "$lock" ;; esac
     return "$status"
 }
 
