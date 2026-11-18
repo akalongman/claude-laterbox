@@ -147,6 +147,9 @@ const NO_BASH_REASON =
     'Claude Code.';
 const NO_BASH_LINE = `laterbox: ${NO_BASH_REASON}`;
 
+// The reason of a run refused for its text: the engine reads its input up to the first NUL (spec 1.8).
+const NUL_REASON = 'the text holds a NUL character, which the queue cannot store';
+
 const ENGINE_TIMEOUT_MS = 10_000;
 const COMPLETION_TIMEOUT_MS = 8_000;
 const COMPLETION_MAX_TOKENS = 200;
@@ -402,8 +405,10 @@ function engineArgv(
 
 // Runs the engine by argument vector, no shell, in the session's working directory, so the queue resolves as it
 // does from a terminal, started as engineInit says. It first waits for the session's search; with no bash found it
-// starts nothing and gives the 4.1 reason. A non-zero exit and a rejection (cannot start, timeout) both become a
-// failed run, as failedRun reports it. The standard output comes back exactly as the engine printed it.
+// starts nothing and gives the 4.1 reason. A text that holds a NUL starts nothing either: the engine reads its input
+// up to the first NUL, so the note would be stored cut short, or a close guarded by the first part of its text alone
+// (spec 1.8). A non-zero exit and a rejection (cannot start, timeout) both become a failed run, as failedRun reports
+// it. The standard output comes back exactly as the engine printed it.
 async function runEngineRaw(
     $: EngineInterface,
     context: EngineContext,
@@ -413,6 +418,9 @@ async function runEngineRaw(
     const launcher = await context.launcher;
     if (launcher.kind === 'missing') {
         return { ok: false, reason: NO_BASH_REASON };
+    }
+    if (input?.includes('\0') === true) {
+        return { ok: false, reason: NUL_REASON };
     }
     const argv = engineArgv(launcher, $.plugin.root, args);
     let failure: RunFailure;

@@ -1608,6 +1608,35 @@ test('an invalid tool input is refused without a run', async ($, on) => {
     expect(world.runs).toEqual([]);
 });
 
+const NUL_REASON = 'the text holds a NUL character, which the queue cannot store';
+
+// The worked example of spec 1.8, and the guard text of a close.
+test('a tool text holding a NUL is refused without a run', async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    const added = await $.tool.call({ tool: QUEUE_TOOL, action: 'add', note: 'fix the retry\u0000 path' });
+    const dropped = await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: 1, text: `${CHECK}\u0000` });
+    expect(added).toEqual({ deny: `later: ${NUL_REASON}` });
+    expect(dropped).toEqual({ deny: `later: ${NUL_REASON}` });
+    expect(world.runs).toEqual([]);
+});
+
+test('a typed note holding a NUL is not parked', OFF, async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    const result = await $.command.run({ command: 'later', args: 'x\u0000y', ...AT_PROMPT });
+    expect(result).toEqual({ text: `later: could not park the note (${NUL_REASON}); typed: x\u0000y` });
+    expect(world.runs).toEqual([]);
+});
+
+// A backslash and a zero typed as two characters are not a NUL.
+test('a note holding a backslash and a zero is parked as typed', OFF, async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    await $.command.run({ command: 'later', args: 'C:\\0\\x', ...AT_PROMPT });
+    expect(engineRuns(world)).toEqual([{ args: ['add'], stdin: 'C:\\0\\x' }]);
+});
+
 // The worked example of spec 3.2: another session closed note 1, so number 2 is no longer B and nothing is dropped.
 test('an engine failure reaches the model as a refusal', async ($, on) => {
     const world = stage(on, {
