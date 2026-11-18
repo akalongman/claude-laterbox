@@ -243,7 +243,9 @@ function stage(on: On, world: World = {}): Stage {
         return { value: undefined };
     });
     on('ui.panes', () => ({ value: [...(world.panes ?? [])] }));
-    on('ui.focus', (_$, e) => {
+    // Named: a test's hook that names no plugin hears laterbox's moves on Claude Code 2.1.296 but not on 2.1.327, and
+    // `{ plugin: '*' }` the reverse.
+    on('ui.focus', { plugin: 'laterbox' }, (_$, e) => {
         if (e.origin.kind === 'plugin' && e.element !== undefined) {
             recorded.focuses.push(e.element);
         }
