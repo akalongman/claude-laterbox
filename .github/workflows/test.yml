@@ -47,6 +47,25 @@ jobs:
       - name: Run shellcheck
         run: shellcheck scripts/later scripts/later.sh tests/*.sh
 
+  current:
+    # The module checks again on the current Claude Code release, whose test
+    # kit can differ from the floor's; the engine suite does not depend on it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Install the current Claude Code
+        run: npm install -g @anthropic-ai/claude-code@latest
+      - name: Log the Claude Code version
+        run: claude --version
+      - name: Validate the plugin
+        run: claude plugin validate . --strict
+      - name: Test the plugin
+        run: claude plugin test .
+
   macos:
     runs-on: macos-latest
     timeout-minutes: 15

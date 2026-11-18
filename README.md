@@ -442,8 +442,9 @@ declarations it needs to `.claude-plugin/types/`, the command
 
 CI (`.github/workflows/test.yml`) runs on every push and pull request to
 `main`. On Linux it installs Claude Code 2.1.296 and runs validate, the
-module tests, the engine suite and shellcheck; on macOS and on Windows under
-Git Bash it runs the engine suite.
+module tests, the engine suite and shellcheck, and a second Linux job runs
+validate and the module tests on the current Claude Code release (npm's
+`latest`); on macOS and on Windows under Git Bash it runs the engine suite.
 
 A change reaches installed copies only when `version` in
 `.claude-plugin/plugin.json` changes, so a release bumps it.
