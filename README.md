@@ -227,12 +227,14 @@ What the hooks module does, call by call:
   user), and, for each folder on `PATH` that holds `git.exe`,
   `bin\bash.exe` in that folder's parent. For every file named here,
   `git.exe` included, the module only asks whether it exists; it opens none
-  of them. A bash candidate counts only when it has a folder part, its file
-  name is `bash.exe`, `sh.exe`, `bash` or `sh`, and it is not under
-  `System32`, `SysWOW64` or `WindowsApps`, which hold WSL's `bash.exe`. A
-  variable the module cannot read counts as unset. When the search finds no
-  bash, a line at session start says to install Git for Windows, and
-  `/later`, the pane and the tool give the same reason.
+  of them. A bash candidate counts only when it is a full path (a drive
+  letter, a colon and a slash, or a network path that starts with two
+  slashes), so none is read against the opened project, its file name is
+  `bash.exe`, `sh.exe`, `bash` or `sh`, and it is not under `System32`,
+  `SysWOW64` or `WindowsApps`, which hold WSL's `bash.exe`. A variable the
+  module cannot read counts as unset. When the search finds no bash, a line
+  at session start says to install Git for Windows, and `/later`, the pane
+  and the tool give the same reason.
 - **The queue file's timestamp and size.** While the pane is open, every
   five seconds: the session's working directory (`session.cwd`), and
   whether the queue file exists, with its modification time and size

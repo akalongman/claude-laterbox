@@ -48,19 +48,26 @@ export function isWindowsHost(variables: BashVariables): boolean {
     return variables.OS === 'Windows_NT';
 }
 
-// Whether a path may name Git's bash: non-empty, not a bare name (a file name with no folder part is never used), its
-// file name bash.exe, sh.exe, bash or sh, and no folder on the way a Windows folder that holds WSL's bash; both
-// slashes separate, case is ignored (1.3).
+// A drive letter, a colon and a slash, or two leading slashes (a UNC path), with either slash.
+const FULLY_QUALIFIED = /^(?:[A-Za-z]:[\\/]|[\\/]{2})/;
+
+// Whether a Windows path is fully qualified, so that it names the same file whatever the working directory is. A
+// bare name, a relative path, a path rooted without a drive (`\Git`) and a drive-relative one (`C:Git`) are not:
+// each is read against the session's working directory or its drive, and that directory is the opened project
+// (1.3).
+export function isFullyQualified(path: string): boolean {
+    return FULLY_QUALIFIED.test(path);
+}
+
+// Whether a path may name Git's bash: fully qualified, so a bare name or a relative path is never used, its file name
+// bash.exe, sh.exe, bash or sh, and no folder on the way a Windows folder that holds WSL's bash; both slashes
+// separate, case is ignored (1.3).
 export function isUsableBash(path: string): boolean {
-    if (path === '') {
+    if (!isFullyQualified(path)) {
         return false;
     }
     const segments = path.toLowerCase().split(SEPARATOR);
-    return (
-        segments.length > 1 &&
-        BASH_NAMES.has(segments.at(-1) ?? '') &&
-        !segments.some((segment) => WINDOWS_FOLDERS.has(segment))
-    );
+    return BASH_NAMES.has(segments.at(-1) ?? '') && !segments.some((segment) => WINDOWS_FOLDERS.has(segment));
 }
 
 // The first candidate of 1.3's five steps, in order, that passes `isUsableBash` and `exists`. An `exists` that rejects
@@ -103,7 +110,8 @@ export async function findBash(
     for (const folder of pathFolders(variables.PATH)) {
         const git = under(folder, 'git.exe');
         const path = under(parentOf(folder), PARENT_BASH);
-        if (git === undefined || path === undefined || !(await isPresent(git))) {
+        // A relative PATH folder is skipped before any look, its git.exe included (1.3).
+        if (git === undefined || path === undefined || !isFullyQualified(git) || !(await isPresent(git))) {
             continue;
         }
         if (isUsableBash(path) && (await isPresent(path))) {

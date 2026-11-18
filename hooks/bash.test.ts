@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing';
 import type { BashSearch, BashStep } from './bash';
-import { findBash, isUsableBash, isWindowsHost, scriptPathOf } from './bash';
+import { findBash, isFullyQualified, isUsableBash, isWindowsHost, scriptPathOf } from './bash';
 
 const GIT_BASH = 'C:\\Program Files\\Git\\bin\\bash.exe';
 const X86_BASH = 'C:\\Program Files (x86)\\Git\\bin\\bash.exe';
@@ -159,8 +159,6 @@ test('a bare bash name in SHELL or the override is never asked about or used', a
 test('a usable bash is named bash or sh and lies outside the Windows system folders', async () => {
     expect(isUsableBash(GIT_BASH)).toBe(true);
     expect(isUsableBash('D:/Git/usr/bin/SH.EXE')).toBe(true);
-    expect(isUsableBash('/usr/bin/bash')).toBe(true);
-    expect(isUsableBash('/bash')).toBe(true);
     expect(isUsableBash('')).toBe(false);
     expect(isUsableBash('bash')).toBe(false);
     expect(isUsableBash('SH.EXE')).toBe(false);
@@ -168,6 +166,67 @@ test('a usable bash is named bash or sh and lies outside the Windows system fold
     expect(isUsableBash('C:\\Program Files\\Git\\bin\\')).toBe(false);
     expect(isUsableBash('C:\\Windows\\SysWOW64\\bash.exe')).toBe(false);
     expect(isUsableBash('C:\\Users\\u\\AppData\\Local\\Microsoft\\WindowsApps\\bash.exe')).toBe(false);
+});
+
+test('only a fully qualified path is usable', async () => {
+    const qualified = [
+        GIT_BASH,
+        'c:/Program Files/Git/bin/bash.exe',
+        '\\\\server\\tools\\Git\\bin\\bash.exe',
+        '//server/tools/Git/bin/sh',
+        '\\\\?\\C:\\Git\\bin\\bash.exe',
+    ];
+    for (const path of qualified) {
+        expect(isFullyQualified(path)).toBe(true);
+        expect(isUsableBash(path)).toBe(true);
+    }
+    const relative = [
+        'Git\\bin\\bash.exe',
+        'tools/bin/bash',
+        '.\\bin\\bash.exe',
+        '\\Git\\bin\\bash.exe',
+        '/usr/bin/bash',
+        '/bash',
+        'C:Git\\bin\\bash.exe',
+        'C:bash.exe',
+        '',
+    ];
+    for (const path of relative) {
+        expect(isFullyQualified(path)).toBe(false);
+        expect(isUsableBash(path)).toBe(false);
+    }
+});
+
+// The worked example of spec 1.3: the opened project ships tools\cmd\git.exe and tools\bin\bash.exe.
+test('a relative PATH folder gives no candidate and is not asked about', async () => {
+    const files = disk(['tools\\cmd\\git.exe', 'tools\\bin\\bash.exe', 'C:\\Program Files\\Git\\cmd\\git.exe', GIT_BASH]);
+    const variables = { PATH: 'tools\\cmd;"tools\\cmd";C:tools\\cmd;\\tools\\cmd;C:\\Program Files\\Git\\cmd' };
+    expect(await findBash(variables, files.exists)).toEqual(found(GIT_BASH, 'path'));
+    expect(files.asked).toEqual(['C:\\Program Files\\Git\\cmd\\git.exe', GIT_BASH]);
+});
+
+test('a relative SHELL, override or install folder is passed over without a look', async () => {
+    const asked: string[] = [];
+    const everything = async (path: string): Promise<boolean> => {
+        asked.push(path);
+        return true;
+    };
+    const variables = {
+        SHELL: '/usr/bin/bash',
+        CLAUDE_CODE_GIT_BASH_PATH: 'tools\\bin\\bash.exe',
+        ProgramFiles: 'Program Files',
+        LOCALAPPDATA: '\\Users\\u\\AppData\\Local',
+        PATH: 'tools\\cmd',
+    };
+    expect(await findBash(variables, everything)).toEqual(NOT_FOUND);
+    expect(asked).toEqual([]);
+});
+
+test('a SHELL that is not fully qualified leaves the install folders to find bash', async () => {
+    const files = disk([GIT_BASH]);
+    const variables = { SHELL: '/usr/bin/bash', ProgramFiles: 'C:\\Program Files' };
+    expect(await findBash(variables, files.exists)).toEqual(found(GIT_BASH, 'program-files'));
+    expect(files.asked).toEqual([GIT_BASH]);
 });
 
 test('the host is Windows only when OS is Windows_NT', async () => {
