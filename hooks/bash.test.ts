@@ -189,6 +189,9 @@ test('only a fully qualified path is usable', async () => {
         '/bash',
         'C:Git\\bin\\bash.exe',
         'C:bash.exe',
+        '\\\\bash.exe',
+        '//sh',
+        '\\\\\\server\\bin\\bash.exe',
         '',
     ];
     for (const path of relative) {

@@ -41,7 +41,8 @@ unset CDPATH
 # Under Git Bash, whatever started it, Git's /usr/bin comes before Windows'
 # system folders on PATH, so Windows' own find.exe and sort.exe in System32
 # never stand in for Git's find and sort (spec 1.7). Bash sets OSTYPE to
-# msys there (cygwin in its kin), so the test starts no process. A PATH that
+# msys there (cygwin in its kin), unless the environment already holds an
+# OSTYPE, which bash keeps, so the test starts no process. A PATH that
 # begins with /usr/bin, or with /mingw64/bin then /usr/bin as Git's launcher
 # sets it, is kept as it is. Before any line that starts a program.
 case ${OSTYPE:-} in
@@ -944,8 +945,8 @@ is_own_link() { # link bin
 # and PATH notices print when their condition starts, not while it lasts.
 terminal_link() {
     [ -n "${CLAUDE_PLUGIN_DATA:-}" ] || return 0
-    # Linux and macOS only, told by OSTYPE, which bash sets, so the test
-    # starts no process.
+    # Linux and macOS only, told by OSTYPE, which bash sets unless the
+    # environment already holds one, so the test starts no process.
     case ${OSTYPE:-} in linux*|darwin*) ;; *) return 0 ;; esac
     local root data user tmp link path_state state seen_link='' seen_path=''
     # The script's own resolved location, never the plugin root variable of

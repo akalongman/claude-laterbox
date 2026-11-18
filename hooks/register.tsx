@@ -147,8 +147,9 @@ const NO_BASH_REASON =
     'Claude Code.';
 const NO_BASH_LINE = `laterbox: ${NO_BASH_REASON}`;
 
-// The reason of a run refused for its text: the engine reads its input up to the first NUL (spec 1.8).
-const NUL_REASON = 'the text holds a NUL character, which the queue cannot store';
+// The reason of a run refused for its text, with what to do: the engine reads its input up to the first NUL (spec
+// 1.8, 4.4).
+const NUL_REASON = 'the text holds a NUL character, which the queue cannot store; remove it and try again';
 
 const ENGINE_TIMEOUT_MS = 10_000;
 const COMPLETION_TIMEOUT_MS = 8_000;
@@ -233,13 +234,14 @@ function promptFor(excerpt: string, typed: string): string {
     );
 }
 
-// A model answer is stored only when it is one non-empty line of at most ANSWER_MAX_CHARS characters.
+// A model answer is stored only when it is one non-empty line of at most ANSWER_MAX_CHARS characters that holds no
+// NUL, which the engine could not store whole (spec 1.8): the typed text is stored in its place.
 function accept(result: ModelForkResult): string | undefined {
     if (!result.isAnswered) {
         return undefined;
     }
     const text = result.text.trim();
-    if (text === '' || text.includes('\n') || text.length > ANSWER_MAX_CHARS) {
+    if (text === '' || text.includes('\n') || text.includes('\0') || text.length > ANSWER_MAX_CHARS) {
         return undefined;
     }
     return collapse(text);
@@ -620,10 +622,13 @@ function memoAfterRead(look: QueueLook, queue: Queue): GateMemo {
 // engine's line, followed by ` (typed: <typed>)` when the rewrite changed the text, or the failure template, which
 // keeps the typed text on screen. The pane's add shows the same line. With no bash found (spec 4.1) nothing can
 // store the note, so it is refused before the rewrite, which would be a model call, or a wait of up to 40 seconds
-// in fork mode, for nothing.
+// in fork mode, for nothing. A typed text that holds a NUL is refused there too, in every rewrite mode (spec 1.8).
 async function park($: EngineInterface, mode: RewriteMode, context: EngineContext, typed: string): Promise<Parked> {
     if ((await context.launcher).kind === 'missing') {
         return { ok: false, line: notParkedLine(NO_BASH_REASON, typed) };
+    }
+    if (typed.includes('\0')) {
+        return { ok: false, line: notParkedLine(NUL_REASON, typed) };
     }
     const stored = await rewrite($, mode, typed);
     const added = await runEngine($, context, ['add'], stored);

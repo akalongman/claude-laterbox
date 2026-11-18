@@ -539,6 +539,7 @@ const REJECTED: ReadonlyArray<readonly [string, ModelCompleteResult]> = [
     ['an empty answer', answered('   ')],
     ['a two-line answer', answered('Check the S3 retry path\nin UploadJob')],
     ['an answer over 300 characters', answered('x'.repeat(301))],
+    ['an answer holding a NUL', answered('Check the S3\u0000 retry path')],
     [
         'a reply that reached the token cap',
         { isAnswered: true, text: 'Check the S3 retry', usage: { ...USAGE, output_tokens: 200 } },
@@ -1608,7 +1609,7 @@ test('an invalid tool input is refused without a run', async ($, on) => {
     expect(world.runs).toEqual([]);
 });
 
-const NUL_REASON = 'the text holds a NUL character, which the queue cannot store';
+const NUL_REASON = 'the text holds a NUL character, which the queue cannot store; remove it and try again';
 
 // The worked example of spec 1.8, and the guard text of a close.
 test('a tool text holding a NUL is refused without a run', async ($, on) => {
@@ -1626,6 +1627,25 @@ test('a typed note holding a NUL is not parked', OFF, async ($, on) => {
     await $.session.start(SESSION);
     const result = await $.command.run({ command: 'later', args: 'x\u0000y', ...AT_PROMPT });
     expect(result).toEqual({ text: `later: could not park the note (${NUL_REASON}); typed: x\u0000y` });
+    expect(world.runs).toEqual([]);
+});
+
+// In the default mode too, and before the rewrite: a note that cannot be stored costs no model call.
+test('a typed note holding a NUL is refused before the small model is asked', async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    const result = await $.command.run({ command: 'later', args: 'x\u0000y', ...AT_PROMPT });
+    expect(result).toEqual({ text: `later: could not park the note (${NUL_REASON}); typed: x\u0000y` });
+    expect(world.completions).toEqual([]);
+    expect(world.runs).toEqual([]);
+});
+
+// A host without bash keeps giving the no-bash reason, whatever the text holds.
+test('with no bash found a text holding a NUL gets the no-bash reason', async ($, on) => {
+    const world = stage(on, { env: { OS: 'Windows_NT' } });
+    await $.session.start(HEADLESS);
+    const added = await $.tool.call({ tool: QUEUE_TOOL, action: 'add', note: 'x\u0000y' });
+    expect(added).toEqual({ deny: `later: ${NO_BASH_REASON}` });
     expect(world.runs).toEqual([]);
 });
 

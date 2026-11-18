@@ -48,8 +48,9 @@ export function isWindowsHost(variables: BashVariables): boolean {
     return variables.OS === 'Windows_NT';
 }
 
-// A drive letter, a colon and a slash, or two leading slashes (a UNC path), with either slash.
-const FULLY_QUALIFIED = /^(?:[A-Za-z]:[\\/]|[\\/]{2})/;
+// A drive letter, a colon and a slash, or two leading slashes, a server name and a slash (a UNC path), with either
+// slash. Two slashes before a lone name (`\\bash.exe`) name no server, so they do not count.
+const FULLY_QUALIFIED = /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/])/;
 
 // Whether a Windows path is fully qualified, so that it names the same file whatever the working directory is. A
 // bare name, a relative path, a path rooted without a drive (`\Git`) and a drive-relative one (`C:Git`) are not:
