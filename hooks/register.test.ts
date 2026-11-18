@@ -933,6 +933,17 @@ for (const surface of SURFACES) {
             expect(rowsReads(world)).toBe(2);
         });
 
+        // A canary, not a behaviour: the test kit (2.1.296 to 2.1.327) refuses laterbox's own $.ui.focus before any
+        // hook sees it, so the ring's moves are never recorded here. When this fails, the kit carries the move out:
+        // assert `toContain('new-note')` instead, and check the moves of j, k and a closed input the same way.
+        test('the test kit does not yet carry out the move into the input', async ($, on) => {
+            const world = stage(on);
+            const ui = await openPane($, surface);
+            await ui.press({ key: 'add' });
+            expect(await ui.find({ type: 'Input', key: 'new-note' })).toBeDefined();
+            expect(world.focuses).toEqual([]);
+        });
+
         test('an empty submit returns to the action line', OFF, async ($, on) => {
             const world = stage(on);
             const ui = await openPane($, surface);
