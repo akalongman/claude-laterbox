@@ -46,7 +46,8 @@ The tool refuses a note over 2,000 characters: shorten it and park it again.
    named the note by what it says and a listing earlier in this conversation
    already gives its id. A number the user gives ("drop note 3") always needs
    a fresh listing: it comes from whatever listing they last saw.
-2. Work out which note is meant. If it is not unambiguous, ask. When the
+2. Work out which note is meant. If it is not unambiguous, ask. When a
+   listing shown in this conversation differs from the fresh one, or the
    note at the user's number in the fresh listing is not the one they
    described, name the note and ask before `done` or `drop`.
 3. Before you ask the user to confirm work on a note whose line ends its text

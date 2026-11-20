@@ -273,6 +273,8 @@ What the hooks module does, call by call:
   weaker than that comparison: when a note was edited or closed after the
   model listed it, the call is refused unless another open note happens to
   have the same id, about 1 chance in 4.3 billion for each open note. A
+  miscopied id is refused on the same odds. A hand edit in an editor takes
+  no lock, as in every earlier version. A
   call with another action, an empty note, or a `show`, `done` or `drop`
   without valid ids is refused with a one-line reason starting `later:`,
   and nothing runs. The module serves the tool itself: its `tool.call`
