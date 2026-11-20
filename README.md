@@ -177,8 +177,9 @@ skip it.
   process (no shell, 10-second timeout; on Windows through Git for Windows'
   `bash.exe`) and makes the rewrite's model calls.
 - The skill `laterbox:notes`, which reaches the queue through the tool
-  `queue` alone, one call per listing or note; its declaration names that
-  tool and nothing else, and it names no shell command.
+  `queue` alone, each call listing the queue, reading notes whole, parking a
+  note or closing one or more notes; its declaration names that tool and
+  nothing else, and it names no shell command.
 - The terminal command, `scripts/later`, which runs `scripts/later.sh`.
 
 What the hooks module does, call by call:
@@ -195,17 +196,19 @@ What the hooks module does, call by call:
   directly; on Windows it starts Git for Windows' `bash.exe`, the one the
   search below finds, with the script's path as its first argument. The
   arguments are one subcommand (`add`, `list`, `rows`, `done` or `drop`)
-  and, for `done` and `drop`, `--if` and the note's number. The text of a
-  note to park, and the text a `done` or `drop` checks the note against,
-  reach the engine on standard input, not in the command, on every
-  platform: Git for Windows rewrites the command line a Windows program
-  hands to bash (a word that starts with `@` is replaced by the contents of
-  the file it names, a word with `*` or `?` is expanded), and standard
-  input passes the text unchanged. The environment variable
-  `CLAUDE_PLUGIN_OPTION_FILE` carries the queue file setting, and
-  `LATER_INPUT=stdin` tells the engine to read the text from standard
-  input. The engine runs in the session's working directory and finds the
-  queue from there. Nothing else is run.
+  and, for `done` and `drop`, either `--if` and the note's number, when the
+  pane closes one note, or `--if-each` alone, when the tool closes one or
+  more. The text of a note to park, the text the pane's `done` or `drop`
+  checks its note against, and the number and text of every note the
+  tool's `done` or `drop` closes reach the engine on standard input, not in
+  the command, on every platform: Git for Windows rewrites the command line
+  a Windows program hands to bash (a word that starts with `@` is replaced
+  by the contents of the file it names, a word with `*` or `?` is
+  expanded), and standard input passes the text unchanged. The environment
+  variable `CLAUDE_PLUGIN_OPTION_FILE` carries the queue file setting, and
+  `LATER_INPUT=stdin` tells the engine to read the texts, and the tool's
+  numbers, from standard input. The engine runs in the session's working
+  directory and finds the queue from there. Nothing else is run.
 - **What it reads.** The conversation's newest messages
   (`session.messages`), only to build the rewrite's excerpt for the model
   call below; and its own pane state (the queue as listed, the selected
@@ -252,17 +255,29 @@ What the hooks module does, call by call:
 - **The tool it registers** (`tool.register`): `queue`, shown in Claude
   Code as `mcp__laterbox__queue` and offered to the model in every session
   that does not deny it (below).
-  Each call runs the same engine as `/later`, as above, in one of four
-  ways: `list` lists the open notes; `add` parks one note, sent on standard
-  input; `done` marks one note done and `drop` drops one, each named by its
-  number and its text in a fresh listing, with `--if` and the number as
-  arguments and the text on standard input, so that when the note at that
-  number no longer has that text, nothing changes and the call is refused.
-  A call with another action, an empty note, or a `done` or `drop` without
-  a whole number of 1 or more and a text is refused with a one-line reason
-  starting `later:`, and nothing runs. The module serves the tool itself:
-  its `tool.call` hook answers each call with the engine's output or a
-  refusal before Claude Code's permission step, so the tool shows no
+  Each call runs the same engine as `/later`, as above, in one of five
+  ways. `list` reads the open notes with `rows` and returns one line per
+  note: its number, an id in square brackets, its text and its age; a text
+  over 100 characters is cut to its first 97 and `...`. `show` reads them
+  the same way and returns the notes named by id whole. `add` parks one
+  note, sent on standard input, and refuses a note over 2,000 characters.
+  `done` marks notes done and `drop` drops them, one or more per call, each
+  named by its id. An id is 8 hexadecimal characters that the module
+  computes from the note's text and its place among open notes with the
+  same text; nothing about it is stored in the queue file. Before a close
+  the module reads the queue again, finds each id's note, and hands the
+  engine each note's number and whole text on standard input
+  (`--if-each`); the engine compares every text byte for byte while it
+  holds the queue's lock, and closes all of them or none. So the engine
+  never closes a note whose text it did not compare. What the id adds is
+  weaker than that comparison: when a note was edited or closed after the
+  model listed it, the call is refused unless another open note happens to
+  have the same id, about 1 chance in 4.3 billion for each open note. A
+  call with another action, an empty note, or a `show`, `done` or `drop`
+  without valid ids is refused with a one-line reason starting `later:`,
+  and nothing runs. The module serves the tool itself: its `tool.call`
+  hook answers each call with a result built from the engine's output, or
+  with a refusal, before Claude Code's permission step, so the tool shows no
   permission dialog and needs no allow rule. A deny rule for
   `mcp__laterbox__queue` is the way to block the tool, for example
   `{"permissions": {"deny": ["mcp__laterbox__queue"]}}` in a Claude Code
