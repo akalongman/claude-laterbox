@@ -13,6 +13,10 @@
 #   done|drop --if <text> <n>
 #                    close note <n> only while its text is still exactly
 #                    <text>; otherwise refuse and change nothing
+#   done|drop --if-each
+#                    the same for several notes in one run, all or none,
+#                    read from one "<n>\t<text>" line per note on standard
+#                    input (LATER_INPUT=stdin only)
 #   all              one line per queue with open notes under the scan roots
 #   session-start    SessionStart hook entry point: a user-visible count line,
 #                    plus the oldest notes once per LATER_DIGEST_DAYS, and
@@ -20,12 +24,13 @@
 #
 # LATER_INPUT=stdin moves the user's text from the arguments to standard
 # input, read whole and byte for byte: add takes no argument and parks the
-# input, and done|drop --if <n> takes one number and compares the input as
-# <text>. Git for Windows' runtime rewrites the arguments a native Windows
-# program passes to bash (an @file word becomes that file's contents, a word
-# holding a glob character is globbed), so the plugin's own callers set it.
-# The terminal command never does; any other value, or none, keeps the
-# argument forms.
+# input, done|drop --if <n> takes one number and compares the input as
+# <text>, and done|drop --if-each, which only this mode has, takes no
+# argument and reads its numbers and texts from the input. Git for Windows'
+# runtime rewrites the arguments a native Windows program passes to bash (an
+# @file word becomes that file's contents, a word holding a glob character
+# is globbed), so the plugin's own callers set it. The terminal command
+# never does; any other value, or none, keeps the argument forms.
 #
 # The queue file is LATER.local.md at the project's root, unless the
 # laterbox.file setting names another file (see resolve_queue_name).
@@ -611,30 +616,45 @@ cmd_rows() {
     done < <(open_notes "$file")
 }
 
-# close_notes <mode> <file> [--if <text>] <n>...
-# With --if, note <n> must still be exactly <text> under the lock; a note
-# that changed or vanished since a program listed it is refused before any
-# temporary file exists. The rewrite changes only the lines it closes: done
-# turns the first [ ] into [x] and keeps the rest, a carriage return or a
-# byte-order mark included; drop removes the whole line. Every other line is
-# copied with the bytes it was read with. A queue saved without a final line
-# end keeps none: awk holds each line back until it has read the next, and
-# writes the file's last line without a newline when the file had none and
-# that line is kept. A line that a dropped last line followed keeps its own
-# line end. The last byte costs one process, whatever the queue's size.
-# cp -p gives the temporary file the queue's mode before the new content
-# goes into it (chmod --reference, which did that after, is GNU only). A
-# queue its owner cannot write is refused before that with NOWRITE_MSG, as
-# append_note refuses it.
+# close_notes <mode> <file> <n>...
+# close_notes <mode> <file> --if <text> <n>
+# close_notes <mode> <file> --each <n> <text> [<n> <text>]...
+# With --if, note <n> must still be exactly <text> under the lock; with
+# --each, every note <n> must still be exactly its own <text>. Each number's
+# shape is checked, then its text, pair by pair in the order given, and the
+# first note that changed or vanished since a program listed it is refused
+# before any temporary file exists; so --each closes all its notes in one
+# rewrite or none. The output names the notes in the order given. The
+# rewrite changes only the lines it closes: done turns the first [ ] into
+# [x] and keeps the rest, a carriage return or a byte-order mark included;
+# drop removes the whole line. Every other line is copied with the bytes it
+# was read with. A queue saved without a final line end keeps none: awk
+# holds each line back until it has read the next, and writes the file's
+# last line without a newline when the file had none and that line is kept.
+# A line that a dropped last line followed keeps its own line end. The last
+# byte costs one process, whatever the queue's size. cp -p gives the
+# temporary file the queue's mode before the new content goes into it
+# (chmod --reference, which did that after, is GNU only). A queue its owner
+# cannot write is refused before that with NOWRITE_MSG, as append_note
+# refuses it.
 # BINMODE=3 makes gawk on Git for Windows read and write bytes as they are;
 # it reads in text mode otherwise and drops every carriage return. Other
 # awks take it for an ordinary variable and ignore it.
 close_notes() {
     local mode="$1" file="$2"; shift 2
-    local guarded='' expect='' rows count n lines tmp verb target dir text ended
-    if [ "${1:-}" = '--if' ]; then
-        guarded=1; expect="${2-}"; shift 2
-    fi
+    local guarded='' rows count n k lines tmp verb target dir text ended
+    # The numbers to close, and with a guard the text each must still have.
+    local -a nums=() expect=()
+    case ${1:-} in
+        --if)
+            guarded=1; expect=("${2-}"); shift 2; nums=("$@") ;;
+        --each)
+            guarded=1; shift
+            while [ $# -ge 2 ]; do nums+=("$1"); expect+=("$2"); shift 2; done ;;
+        *)
+            nums=("$@") ;;
+    esac
+    set -- "${nums[@]}"
     # Rewrite beside the real file, so a symlinked queue stays a symlink.
     # real_path may run in this shell (the folder lock), and it goes back to
     # this folder; nothing below or after this function reads a relative
@@ -651,14 +671,16 @@ close_notes() {
     esac
     rows=$(open_notes "$file")
     count=$(row_count "$rows")
+    k=0
     for n in "$@"; do
         case "$n" in
             ''|*[!0123456789]*|??????????*) echo "later: not a note number: $n" >&2; return 1 ;;
         esac
-        if [ -n "$guarded" ] && { ! text=$(row_text "$rows" "$((10#$n))") || [ "$text" != "$expect" ]; }; then
+        if [ -n "$guarded" ] && { ! text=$(row_text "$rows" "$((10#$n))") || [ "$text" != "${expect[k]}" ]; }; then
             echo "later: note $n changed since it was listed; nothing changed" >&2
             return 1
         fi
+        k=$((k + 1))
         if [ "$n" -lt 1 ] || [ "$n" -gt "$count" ]; then
             echo "later: no note $n (the queue has $count open)" >&2
             return 1
@@ -690,9 +712,37 @@ close_notes() {
 }
 
 cmd_close() {
-    local mode="$1" file expect; shift
+    local mode="$1" file expect input rec tab=$'\t'; shift
+    local -a pairs=()
     [ $# -gt 0 ] || { echo "later: $mode needs at least one note number" >&2; return 1; }
-    if [ "$1" = '--if' ] && [ "${LATER_INPUT:-}" = stdin ]; then
+    if [ "$1" = '--if-each' ]; then
+        if [ $# -ne 1 ] || [ "${LATER_INPUT:-}" != stdin ]; then
+            echo 'later: --if-each takes its notes from standard input and no argument' >&2
+            return 1
+        fi
+        # One "<n>\t<text>" record per line, the whole input read before the
+        # lock is taken, as --if reads its text. The text is everything after
+        # the first tab up to the newline, tabs and trailing spaces kept. An
+        # empty line is skipped, and a last line without a newline counts, as
+        # the here-string ends in one. A line without a tab holds no number
+        # and is refused here. The read builtin splits the lines: no process,
+        # and one pass over the input, where pattern removal on what is left
+        # would read it again for every record. close_notes then sees
+        # --each <n> <text>...
+        IFS= read -r -d '' input
+        while IFS= read -r rec; do
+            case $rec in
+                '') ;;
+                *"$tab"*) pairs+=("${rec%%"$tab"*}" "${rec#*"$tab"}") ;;
+                *) echo "later: not a note number: $rec" >&2; return 1 ;;
+            esac
+        done <<< "$input"
+        if [ "${#pairs[@]}" -eq 0 ]; then
+            echo 'later: --if-each needs at least one note on standard input' >&2
+            return 1
+        fi
+        set -- --each "${pairs[@]}"
+    elif [ "$1" = '--if' ] && [ "${LATER_INPUT:-}" = stdin ]; then
         [ $# -eq 2 ] || { echo 'later: --if takes exactly one note number' >&2; return 1; }
         # The text is the whole input, untrimmed, read before the lock is
         # taken; close_notes then sees the argument form --if <text> <n>.
@@ -1109,7 +1159,7 @@ cmd_session_start() {
 }
 
 usage() {
-    echo 'usage: later.sh {add <note> | list | rows | done [--if <text>] <n>... | drop [--if <text>] <n>... | all | session-start}'
+    echo 'usage: later.sh {add <note> | list | rows | done [--if <text>] <n>... | drop [--if <text>] <n>... | done|drop --if-each | all | session-start}'
 }
 
 # Before the dispatch, so session-start stores the setting before any of its

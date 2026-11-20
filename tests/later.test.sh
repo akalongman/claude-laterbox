@@ -657,6 +657,87 @@ be="$(mk_repo)"
 printf -- '- [ ] before\n%s- [ ] after a mark\n' "$BOM" > "$be/$Q"
 assert_eq "$(lt "$be" list)" "$(basename "$be"): 1 parked"$'\n'" 1. before (undated)" "BOM: a mark after the first line is text"
 
+# --- a guarded close of several notes ---------------------------------
+# Spec 4.3 and 4.4: with LATER_INPUT=stdin, done|drop --if-each reads one
+# "<n>\t<text>" record per note from standard input, compares every named
+# note with its text under the lock, and closes them all in one rewrite or
+# refuses and changes nothing.
+
+# Records for --if-each: "<n>\t<text>" per argument, numbered from 1, the
+# last without a newline once in a command substitution.
+each_records() { local i=0 text; for text in "$@"; do i=$((i + 1)); printf '%s\t%s\n' "$i" "$text"; done; } # texts...
+
+ie="$(mk_repo)"
+printf '%s\n' '- [ ] A' '- [ ] B' '- [x] closed' '- [ ] C (2026-10-01 10:00)' '- [ ] D' > "$ie/$Q"
+before="$(file_digest "$ie/$Q")"
+CHANGED4='later: note 4 changed since it was listed; nothing changed'
+out="$(lt_in "$ie" "2${T}B"$'\n'"4${T}X"$'\n' drop --if-each 2>&1; echo "exit $?")"
+assert_eq "$out" "$CHANGED4"$'\n'"exit 1" "--if-each: one text that differs refuses the whole close"
+out="$(lt_in "$ie" "2${T}B"$'\n'"9${T}D"$'\n' drop --if-each 2>&1; echo "exit $?")"
+assert_eq "$out" "later: note 9 changed since it was listed; nothing changed"$'\n'"exit 1" "--if-each: a number past the end refuses the whole close"
+out="$(lt_in "$ie" '' drop --if-each 2>&1; echo "exit $?")"
+assert_eq "$out" "later: --if-each needs at least one note on standard input"$'\n'"exit 1" "--if-each: no record is refused"
+out="$(lt_in "$ie" "2${T}B"$'\n' drop --if-each 3 2>&1; echo "exit $?")"
+assert_eq "$out" "later: --if-each takes its notes from standard input and no argument"$'\n'"exit 1" "--if-each: an argument is refused"
+out="$(printf '2\tB\n' | lt "$ie" drop --if-each 2>&1; echo "exit $?")"
+assert_eq "$out" "later: --if-each takes its notes from standard input and no argument"$'\n'"exit 1" "--if-each: refused without LATER_INPUT=stdin"
+out="$(lt_in "$ie" "B"$'\n' drop --if-each 2>&1; echo "exit $?")"
+assert_eq "$out" "later: not a note number: B"$'\n'"exit 1" "--if-each: a record without a number is refused"
+out="$(lt_in "$ie" "2"$'\n' drop --if-each 2>&1; echo "exit $?")"
+assert_eq "$out" "later: not a note number: 2"$'\n'"exit 1" "--if-each: a line without a tab is refused, digits alone too"
+assert_eq "$(file_digest "$ie/$Q")" "$before" "--if-each: every refused form leaves the queue byte-identical"
+assert_eq "$(find "$ie" -mindepth 1 -maxdepth 1 ! -name .git ! -name README.md ! -name "$Q" | count_lines)" "0" "--if-each: a refusal leaves no temporary file"
+
+# Review Focus 5: an empty line between records, and no final newline.
+out="$(lt_in "$ie" "2${T}B"$'\n\n'"4${T}D" drop --if-each 2>&1)"
+assert_eq "$out" "later: dropped -> B"$'\n'"later: dropped -> D" "--if-each: drops every named note in one run"
+assert_eq "$(lt "$ie" rows | sed 1d | cut -f4-)" "A"$'\n'"C" "--if-each: the other notes stay"
+out="$(lt_in "$ie" "2${T}C"$'\n'"1${T}A"$'\n' done --if-each 2>&1)"
+assert_eq "$out" "later: done -> C"$'\n'"later: done -> A" "--if-each: done answers in the order of the records"
+assert_eq "$(sed -n 1p "$ie/$Q")" "- [x] A" "--if-each: done ticks the first note"
+assert_eq "$(sed -n 3p "$ie/$Q")" "- [x] C (2026-10-01 10:00)" "--if-each: done ticks the note and keeps its stamp"
+assert_contains "$(XDG_STATE_HOME="$T_STATE" PATH="$ENGINE_PATH" bash "$ENGINE" 2>&1)" "done|drop --if-each" "usage names the --if-each form"
+
+# Spec 8.2's texts, a tab and trailing spaces, one note each beside README.md
+# and a.md, so an @file or a glob would find something: one run closes all of
+# them, and on a fresh copy a record that lacks the trailing spaces refuses
+# the whole close.
+EACH_TEXTS=("${STDIN_TEXTS[@]}" "split${T}here" 'ends here  ')
+ix="$(mk_repo)"; iy="$(mk_repo)"
+printf 'SECRET\n' > "$ix/README.md"
+printf 'a\n' > "$ix/a.md"
+for text in "${EACH_TEXTS[@]}"; do printf -- '- [ ] %s\n' "$text"; done > "$ix/$Q"
+cp "$ix/README.md" "$ix/a.md" "$ix/$Q" "$iy/"
+want="$(for text in "${EACH_TEXTS[@]}"; do printf 'later: done -> %s\n' "$text"; done)"
+assert_eq "$(lt_in "$ix" "$(each_records "${EACH_TEXTS[@]}")" done --if-each 2>&1)" "$want" "--if-each: every text is matched byte for byte"
+assert_eq "$(grep -c '^- \[x\]' "$ix/$Q")" "${#EACH_TEXTS[@]}" "--if-each: one run closes every named note"
+before="$(file_digest "$iy/$Q")"
+out="$(lt_in "$iy" "$(each_records "${STDIN_TEXTS[@]}" "split${T}here" 'ends here')" done --if-each 2>&1; echo "exit $?")"
+assert_eq "$out" "later: note ${#EACH_TEXTS[@]} changed since it was listed; nothing changed"$'\n'"exit 1" "--if-each: a text without its trailing spaces refuses the whole close"
+assert_eq "$(file_digest "$iy/$Q")" "$before" "--if-each: a refused close of many leaves the queue byte-identical"
+
+# The same close under a byte locale, for the Georgian text.
+ig="$(mk_repo)"
+printf -- '- [ ] %s\n' 'შეამოწმე ექსპორტი' 'ნინო' > "$ig/$Q"
+out="$(LC_ALL=C lt_in "$ig" "$(each_records 'შეამოწმე ექსპორტი' 'ნინო')" done --if-each 2>&1)"
+assert_eq "$out" "later: done -> შეამოწმე ექსპორტი"$'\n'"later: done -> ნინო" "--if-each under LC_ALL=C: Georgian texts are matched byte for byte"
+assert_eq "$(grep -c '^- \[x\]' "$ig/$Q")" "2" "--if-each under LC_ALL=C: both Georgian notes are closed"
+
+# A queue with CRLF line ends and one that starts with a byte-order mark:
+# both notes are ticked, each line end and the mark kept.
+ic="$(mk_repo)"
+printf '%s\r\n' '- [ ] crlf one (2026-10-01 10:00)' '- [ ] crlf two' '- [ ] crlf three' > "$ic/$Q"
+l3="$(line_bytes "$ic/$Q" 3)"
+assert_eq "$(lt_in "$ic" "$(each_records 'crlf one' 'crlf two')" done --if-each 2>&1)" "later: done -> crlf one"$'\n'"later: done -> crlf two" "CRLF: done --if-each matches the texts without their carriage returns"
+assert_eq "$(line_bytes "$ic/$Q" 1)" "$(printf '%s\r\n' '- [x] crlf one (2026-10-01 10:00)' | od -c)" "CRLF: done --if-each ticks note 1 and keeps its stamp and line end"
+assert_eq "$(line_bytes "$ic/$Q" 2)" "$(printf '%s\r\n' '- [x] crlf two' | od -c)" "CRLF: done --if-each ticks note 2 and keeps its line end"
+assert_eq "$(line_bytes "$ic/$Q" 3)" "$l3" "CRLF: done --if-each leaves line 3 byte-identical"
+ib="$(mk_repo)"
+printf '%s- [ ] first\n- [ ] second\n' "$BOM" > "$ib/$Q"
+assert_eq "$(lt_in "$ib" "$(each_records first second)" done --if-each 2>&1)" "later: done -> first"$'\n'"later: done -> second" "BOM: done --if-each matches the first line's note"
+assert_eq "$(line_bytes "$ib/$Q" 1)" "$(printf '%s- [x] first\n' "$BOM" | od -c)" "BOM: done --if-each ticks note 1 and keeps the mark"
+assert_eq "$(line_bytes "$ib/$Q" 2)" "$(printf -- '- [x] second\n' | od -c)" "BOM: done --if-each ticks note 2"
+
 # --- all --------------------------------------------------------------
 
 roots="$(mktemp -d)"; TMPDIRS+=("$roots")
@@ -1004,6 +1085,16 @@ else
         assert_eq "$many" "$few" "the process budget: $cmd starts as many processes on 100 notes as on 5"
         assert_ok "the process budget: strace saw $cmd start processes ($few)" test "$few" -gt 0
     done
+    # Spec 4.4: a guarded close of notes 1 and 2, named by the texts rows
+    # gives, read outside the traced run.
+    each_in() { lt "$1" rows | awk -F'\t' '$1 == "note" && $2 <= 2 { print $2 "\t" $4 }'; } # dir
+    few="$(each_in "$pb5" | LATER_INPUT=stdin forks_of "$pb5" done --if-each)"
+    many="$(each_in "$pb100" | LATER_INPUT=stdin forks_of "$pb100" done --if-each)"
+    assert_eq "$many" "$few" "the process budget: done --if-each starts as many processes on 100 notes as on 5"
+    assert_ok "the process budget: strace saw done --if-each start processes ($few)" test "$few" -gt 0
+    # A refused run starts processes too; the counts compare closes only when
+    # both runs closed their two notes.
+    assert_eq "$(grep -c '^- \[x\]' "$pb5/$Q") $(grep -c '^- \[x\]' "$pb100/$Q")" "3 3" "the process budget: done --if-each closed notes 1 and 2 of each queue"
 fi
 
 # --- portability ------------------------------------------------------
