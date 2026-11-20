@@ -15,6 +15,7 @@ import type {
 } from 'claude-code';
 import type { Engine, MockClock, Mounted, Plugin } from 'claude-code/testing';
 import { describe, expect, mock, test } from 'claude-code/testing';
+import { noteId } from './notes';
 import { TOOL_DESCRIPTION, TOOL_INPUT_SCHEMA } from './tool';
 
 const SESSION = { cwd: '/home/u/projects/org/app', surface: 'terminal', isInteractive: true } as const;
@@ -1561,64 +1562,171 @@ test('a refused tool registration shows a toast and the session still starts', a
     expect(world.toasts[0]).toContain('refused by the test');
 });
 
-// One call per action; each answers with the engine's output, its trailing newline trimmed.
-test('the tool lists, adds and closes through the engine', async ($, on) => {
-    const world = stage(on);
+// A note's id as the tool computes it for the first open note with that text.
+function ID(text: string): string {
+    return noteId(text, 1);
+}
+
+// The reason of a show, done or drop without valid ids.
+const IDS_REASON =
+    'later: show, done and drop need ids from a listing: the 8 characters in square brackets on a line, without the ' +
+    'brackets; list first';
+
+// The reason of an add over the tool's limit, for a note of 2,001 characters.
+const LIMIT_REASON = 'later: the note is 2001 characters and the limit is 2000; shorten it and park it again';
+
+// The listing comes from `rows`, not the engine's `list`: each line carries the note's id and its text cut at 100.
+test('the tool lists from rows with ids and cut texts', async ($, on) => {
+    const long = 'x'.repeat(150);
+    const world = stage(on, { rows: () => rowsOf('shop', [['3d', CHECK], ['today', long]]) });
     await $.session.start(SESSION);
     const listed = await $.tool.call({ tool: QUEUE_TOOL, action: 'list' });
-    const added = await $.tool.call({ tool: QUEUE_TOOL, action: 'add', note: AT_FILE });
-    const done = await $.tool.call({ tool: QUEUE_TOOL, action: 'done', number: 1, text: CHECK });
-    const dropped = await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: 2, text: 'ends here  ' });
-    expect(engineRuns(world)).toEqual([
-        { args: ['list'] },
-        { args: ['add'], stdin: AT_FILE },
-        { args: ['done', '--if', '1'], stdin: CHECK },
-        { args: ['drop', '--if', '2'], stdin: 'ends here  ' },
-    ]);
-    expect(world.inits.map((init) => init?.env?.['LATER_INPUT'])).toEqual([undefined, 'stdin', 'stdin', 'stdin']);
-    expect(world.runs.every((argv) => argv[0]?.endsWith('/scripts/later.sh'))).toBe(true);
-    expect(listed).toEqual({ result: LISTING.trimEnd() });
-    expect(added).toEqual({ result: `later: parked -> ${AT_FILE}` });
-    expect(done).toEqual({ result: `later: done -> ${CHECK}` });
-    expect(dropped).toEqual({ result: 'later: dropped -> ends here' });
+    expect(listed).toEqual({
+        result: `shop: 2 parked\n 1. [${ID(CHECK)}] ${CHECK} (3d)\n 2. [${ID(long)}] ${'x'.repeat(97)}... (today)`,
+    });
+    expect(engineRuns(world)).toEqual([{ args: ['rows'] }]);
 });
 
-// Review focus 5: a number that is zero, negative, fractional or a string, or no text, runs nothing.
+test('an empty queue lists as no parked notes', async ($, on) => {
+    stage(on, { rows: () => rowsOf('shop', []) });
+    await $.session.start(SESSION);
+    expect(await $.tool.call({ tool: QUEUE_TOOL, action: 'list' })).toEqual({ result: 'later: no parked notes' });
+});
+
+// Spec 2.3: a `rows` run the engine refuses is reported with its reason, where `list` answered no parked notes.
+test('a failed rows read refuses the listing with its reason', async ($, on) => {
+    const world = stage(on, { engine: { exitCode: 1, stdout: '', stderr: 'later: cannot resolve the queue here\n' } });
+    await $.session.start(SESSION);
+    const listed = await $.tool.call({ tool: QUEUE_TOOL, action: 'list' });
+    expect(listed).toEqual({ deny: 'later: cannot resolve the queue here' });
+    expect(engineRuns(world)).toEqual([{ args: ['rows'] }]);
+});
+
+// The ids name RAISE and ASK in that order; the lines come in queue order, whole, from one `rows` run.
+test('show gives the named notes whole in queue order', async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    const shown = await $.tool.call({ tool: QUEUE_TOOL, action: 'show', ids: [ID(RAISE), ID(ASK)] });
+    expect(shown).toEqual({ result: ` 2. [${ID(ASK)}] ${ASK} (today)\n 3. [${ID(RAISE)}] ${RAISE} (12d)` });
+    expect(engineRuns(world)).toEqual([{ args: ['rows'] }]);
+});
+
+test('a show with an id that names nothing is refused after one rows run', async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    const shown = await $.tool.call({ tool: QUEUE_TOOL, action: 'show', ids: ['00000000'] });
+    expect(shown).toEqual({ deny: 'later: no open note [00000000]; list again' });
+    expect(engineRuns(world)).toEqual([{ args: ['rows'] }]);
+});
+
+// RAISE is named twice and before CHECK: the engine gets each note once, in queue order, by its number and its whole
+// text on standard input, and nothing of either text in its arguments.
+test('a close names several notes by id and is one guarded run', async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    const done = await $.tool.call({ tool: QUEUE_TOOL, action: 'done', ids: [ID(RAISE), ID(CHECK), ID(RAISE)] });
+    expect(engineRuns(world)).toEqual([
+        { args: ['rows'] },
+        { args: ['done', '--if-each'], stdin: `1\t${CHECK}\n3\t${RAISE}\n` },
+    ]);
+    expect(world.inits[1]?.env?.['LATER_INPUT']).toBe('stdin');
+    expect(done).toEqual({ result: `later: done -> [${ID(CHECK)}] ${CHECK}\nlater: done -> [${ID(RAISE)}] ${RAISE}` });
+});
+
+test('a close with an id that names nothing starts no closing run', async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    const dropped = await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', ids: [ID(CHECK), '00000000'] });
+    expect(dropped).toEqual({ deny: 'later: no open note [00000000]; nothing changed, list again' });
+    expect(engineRuns(world)).toEqual([{ args: ['rows'] }]);
+});
+
+// The worked example of spec 4.3: another session closed note 1 after the module read the queue, so note 2 is no
+// longer ASK, the engine refuses under its lock and nothing is dropped.
+test("the engine's refusal of a close reaches the model as a refusal", async ($, on) => {
+    const world = stage(on, {
+        closeNote: () => ({
+            exitCode: 1,
+            stdout: '',
+            stderr: 'later: note 2 changed since it was listed; nothing changed\n',
+        }),
+    });
+    await $.session.start(SESSION);
+    const dropped = await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', ids: [ID(ASK)] });
+    expect(dropped).toEqual({ deny: 'later: note 2 changed since it was listed; nothing changed' });
+    expect(engineRuns(world)).toEqual([
+        { args: ['rows'] },
+        { args: ['drop', '--if-each'], stdin: `2\t${ASK}\n` },
+    ]);
+});
+
+// The engine's echo of the stored note is cut as a listing cuts it; the engine still gets the whole note.
+test('an add answers with the parked note cut', async ($, on) => {
+    const note = `${AT_FILE} ${'y'.repeat(134)}`;
+    expect(note).toHaveLength(150);
+    const world = stage(on);
+    await $.session.start(SESSION);
+    const added = await $.tool.call({ tool: QUEUE_TOOL, action: 'add', note });
+    expect(added).toEqual({ result: `later: parked -> ${note.slice(0, 97)}...` });
+    expect(engineRuns(world)).toEqual([{ args: ['add'], stdin: note }]);
+    expect(world.inits[0]?.env?.['LATER_INPUT']).toBe('stdin');
+});
+
+test('an add over the limit is refused without a run', async ($, on) => {
+    const world = stage(on);
+    await $.session.start(SESSION);
+    const added = await $.tool.call({ tool: QUEUE_TOOL, action: 'add', note: 'x'.repeat(2_001) });
+    expect(added).toEqual({ deny: LIMIT_REASON });
+    expect(world.runs).toEqual([]);
+});
+
+// Review focus 1: an id copied with its square brackets runs nothing, as does the old form of a close.
 test('an invalid tool input is refused without a run', async ($, on) => {
     const world = stage(on);
     await $.session.start(SESSION);
-    const close = "later: done and drop need a whole note number of 1 or more and the note's text";
     const results = [
-        await $.tool.call({ tool: QUEUE_TOOL, action: 'done', number: 0, text: CHECK }),
-        await $.tool.call({ tool: QUEUE_TOOL, action: 'done', number: -1, text: CHECK }),
-        await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: 1.5, text: CHECK }),
-        await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: '2', text: CHECK }),
-        await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: 2 }),
+        await $.tool.call({ tool: QUEUE_TOOL, action: 'done', number: 1, text: CHECK }),
+        await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', ids: [] }),
+        await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', ids: [`[${ID(CHECK)}]`] }),
         await $.tool.call({ tool: QUEUE_TOOL, action: 'add', note: ' \t ' }),
         await $.tool.call({ tool: QUEUE_TOOL, action: 'peek' }),
     ];
     expect(results).toEqual([
-        { deny: close },
-        { deny: close },
-        { deny: close },
-        { deny: close },
-        { deny: close },
+        { deny: IDS_REASON },
+        { deny: IDS_REASON },
+        { deny: IDS_REASON },
         { deny: 'later: add needs a note that is not empty' },
-        { deny: 'later: action must be list, add, done or drop' },
+        { deny: 'later: action must be list, show, add, done or drop' },
     ]);
     expect(world.runs).toEqual([]);
 });
 
+// Spec 9.3, on Nino's queue: 40 notes of 500 characters each, every text its own.
+test('a listing of 40 long notes and a close of two stay small', async ($, on) => {
+    const texts = Array.from({ length: 40 }, (_, index) => `note ${index + 1} `.padEnd(500, 'abcde '));
+    const world = stage(on, { rows: () => rowsOf('billing', texts.map((text): [string, string] => ['3d', text])) });
+    await $.session.start(SESSION);
+    const listed = await $.tool.call({ tool: QUEUE_TOOL, action: 'list' });
+    const listing = typeof listed.result === 'string' ? listed.result : '';
+    expect(listing.split('\n')).toHaveLength(41);
+    expect(listing.length).toBeLessThan(5_100);
+    const runsBefore = world.runs.length;
+    const ids = [ID(texts[4] ?? ''), ID(texts[31] ?? '')];
+    const done = await $.tool.call({ tool: QUEUE_TOOL, action: 'done', ids });
+    const closed = typeof done.result === 'string' ? done.result : '';
+    expect(world.runs.length - runsBefore).toBe(2);
+    expect(closed.split('\n')).toHaveLength(2);
+    expect(closed.length).toBeLessThan(300);
+});
+
 const NUL_REASON = 'the text holds a NUL character, which the queue cannot store; remove it and try again';
 
-// The worked example of spec 1.8, and the guard text of a close.
-test('a tool text holding a NUL is refused without a run', async ($, on) => {
+// The worked example of spec 1.8.
+test('a tool note holding a NUL is refused without a run', async ($, on) => {
     const world = stage(on);
     await $.session.start(SESSION);
     const added = await $.tool.call({ tool: QUEUE_TOOL, action: 'add', note: 'fix the retry\u0000 path' });
-    const dropped = await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: 1, text: `${CHECK}\u0000` });
     expect(added).toEqual({ deny: `later: ${NUL_REASON}` });
-    expect(dropped).toEqual({ deny: `later: ${NUL_REASON}` });
     expect(world.runs).toEqual([]);
 });
 
@@ -1655,17 +1763,6 @@ test('a note holding a backslash and a zero is parked as typed', OFF, async ($, 
     await $.session.start(SESSION);
     await $.command.run({ command: 'later', args: 'C:\\0\\x', ...AT_PROMPT });
     expect(engineRuns(world)).toEqual([{ args: ['add'], stdin: 'C:\\0\\x' }]);
-});
-
-// The worked example of spec 3.2: another session closed note 1, so number 2 is no longer B and nothing is dropped.
-test('an engine failure reaches the model as a refusal', async ($, on) => {
-    const world = stage(on, {
-        engine: { exitCode: 1, stdout: '', stderr: 'later: note 2 changed since it was listed; nothing changed\n' },
-    });
-    await $.session.start(SESSION);
-    const dropped = await $.tool.call({ tool: QUEUE_TOOL, action: 'drop', number: 2, text: 'B' });
-    expect(dropped).toEqual({ deny: 'later: note 2 changed since it was listed; nothing changed' });
-    expect(engineRuns(world)).toEqual([{ args: ['drop', '--if', '2'], stdin: 'B' }]);
 });
 
 test('with no bash found the tool refuses with the plain reason', async ($, on) => {

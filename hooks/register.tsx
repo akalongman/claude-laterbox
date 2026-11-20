@@ -20,7 +20,18 @@ import type { RunFailure } from './failure';
 import { failureKindOf, failureReason } from './failure';
 import type { FileLook, GateMemo } from './gate';
 import { needsRead } from './gate';
-import { engineCallOf, parseToolInput, TOOL_DESCRIPTION, TOOL_INPUT_SCHEMA } from './tool';
+import {
+    closedOf,
+    closeRecords,
+    listedNotes,
+    listingOf,
+    parkedOf,
+    resolveIds,
+    shownOf,
+    unresolvedReason,
+} from './notes';
+import type { ToolRequest } from './tool';
+import { parseToolInput, TOOL_DESCRIPTION, TOOL_INPUT_SCHEMA } from './tool';
 
 // The queue tool's arguments as the model sent them. Declared here, the tool's name types the `tool.call` hook below
 // whatever MCP tools the type root lists (a root written while servers were connected lists theirs alone). Declared
@@ -650,6 +661,37 @@ async function listQueue($: EngineInterface, context: EngineContext): Promise<Co
     return listed.ok ? { text: listed.stdout, context: [LIST_NOTE] } : { text: `later: ${listed.reason}` };
 }
 
+// The queue tool's answer to a request (spec R2 to R5): its standard output is the call's result and its reason the
+// refusal. An `add` runs the engine's `add`, the note on standard input, and answers with the parked note cut. Every
+// other request reads the queue with `rows` once; a read that fails gives its reason. A `list` answers with the
+// listing, a `show` with the named notes whole. A `done` or `drop` starts its closing run only when every id names one
+// open note, and then one run, `<action> --if-each`, closes them all: each note's number in this reading and its
+// whole text go on standard input, and the engine refuses, changing nothing, when any of them differs under its lock.
+// An id that names no note, or more than one, refuses the whole call before that run.
+async function serveTool($: EngineInterface, context: EngineContext, request: ToolRequest): Promise<EngineOutcome> {
+    if (request.action === 'add') {
+        const added = await runEngine($, context, ['add'], request.note);
+        return added.ok ? { ok: true, stdout: parkedOf(added.stdout) } : added;
+    }
+    const queue = await readQueue($, context);
+    if (queue.kind === 'failed') {
+        return { ok: false, reason: queue.reason };
+    }
+    const notes = listedNotes(queue.rows);
+    if (request.action === 'list') {
+        return { ok: true, stdout: listingOf(queue.label, notes) };
+    }
+    const resolved = resolveIds(notes, request.ids);
+    if (!resolved.ok) {
+        return { ok: false, reason: unresolvedReason(resolved, request.action) };
+    }
+    if (request.action === 'show') {
+        return { ok: true, stdout: shownOf(resolved.notes) };
+    }
+    const closed = await runEngine($, context, [request.action, '--if-each'], closeRecords(resolved.notes));
+    return closed.ok ? { ok: true, stdout: closedOf(request.action, resolved.notes) } : closed;
+}
+
 // Runs `work`, a read of the queue and the writes that follow it, as one read in flight. The count holds the timer's
 // reads back until every read has settled, whichever settles first. Reads are numbered as they start, and
 // `isOvertaken()` turns true once another read has started after this one: that one holds the fresher queue.
@@ -1114,19 +1156,19 @@ export const register: Register = (on, options) => {
         return parked.ok ? { text: parked.line, context: [parkedNote(parked.stored)] } : { text: parked.line };
     });
 
-    // The queue tool (spec 3.1, 3.2). Its own arguments are checked first, and an invalid call is refused without a
-    // run. A valid one runs the engine as `/later` does, user text on standard input; a `done` or `drop` is guarded
-    // by the note's text, so a queue that changed since the model's listing refuses it and changes nothing. The
-    // engine's output is the result, and any failure reaches the model as a refusal. The tool is the module's own:
-    // a call no hook answers fails, so next is never called. The module answers no `tool.check` for it (spec 3.5).
+    // The queue tool (spec R2 to R6). Its own arguments are checked first, and an invalid call is refused without a
+    // run. A valid one is served as serveTool says: user text reaches the engine on standard input alone, and a
+    // `done` or `drop` sends the engine only each named note's number and whole text from a fresh `rows` reading, never
+    // what the model typed, so the engine still compares whole texts under its lock. The module writes the result,
+    // and any failure reaches the model as a refusal. The tool is the module's own: a call no hook answers fails, so
+    // next is never called. The module answers no `tool.check` for it (0.3.0 R3.5).
     on('tool.call', { tool: 'mcp__laterbox__queue' }, async ($, e) => {
         const parsed = parseToolInput(e);
         if (!parsed.ok) {
             return { deny: `later: ${parsed.reason}` };
         }
-        const { args, input } = engineCallOf(parsed.request);
-        const ran = await runEngine($, session, args, input);
-        return ran.ok ? { result: ran.stdout } : { deny: `later: ${ran.reason}` };
+        const served = await serveTool($, session, parsed.request);
+        return served.ok ? { result: served.stdout } : { deny: `later: ${served.reason}` };
     });
 
     on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => drawPane($, e, session, mode));
