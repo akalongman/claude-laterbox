@@ -688,6 +688,17 @@ assert_eq "$out" "later: not a note number: 2"$'\n'"exit 1" "--if-each: a line w
 assert_eq "$(file_digest "$ie/$Q")" "$before" "--if-each: every refused form leaves the queue byte-identical"
 assert_eq "$(find "$ie" -mindepth 1 -maxdepth 1 ! -name .git ! -name README.md ! -name "$Q" | count_lines)" "0" "--if-each: a refusal leaves no temporary file"
 
+# The pairs that --if-each hands on are no argument form: --each from a
+# caller is a word that is not a number, with LATER_INPUT=stdin or without.
+iz="$(mk_repo)"
+printf '%s\n' '- [ ] A' '- [ ] B' > "$iz/$Q"
+before="$(file_digest "$iz/$Q")"
+out="$(lt "$iz" drop --each 2 B 2>&1; echo "exit $?")"
+assert_eq "$out" "later: not a note number: --each"$'\n'"exit 1" "--each in the arguments is refused"
+out="$(lt_in "$iz" "2${T}B"$'\n' drop --each 2 B 2>&1; echo "exit $?")"
+assert_eq "$out" "later: not a note number: --each"$'\n'"exit 1" "--each in the arguments is refused under LATER_INPUT=stdin too"
+assert_eq "$(file_digest "$iz/$Q")" "$before" "--each in the arguments leaves the queue byte-identical"
+
 # Review Focus 5: an empty line between records, and no final newline.
 out="$(lt_in "$ie" "2${T}B"$'\n\n'"4${T}D" drop --if-each 2>&1)"
 assert_eq "$out" "later: dropped -> B"$'\n'"later: dropped -> D" "--if-each: drops every named note in one run"

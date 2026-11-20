@@ -616,9 +616,14 @@ cmd_rows() {
     done < <(open_notes "$file")
 }
 
-# close_notes <mode> <file> <n>...
+# close_notes <mode> <file> -- <n>...
 # close_notes <mode> <file> --if <text> <n>
 # close_notes <mode> <file> --each <n> <text> [<n> <text>]...
+# The third argument names the form. cmd_close, the one caller, always
+# gives it, so no word a caller of the engine gave is read as a form: a
+# caller's --each reaches the number check of the -- form. A form that
+# names no note, or an --each list without a text for each number, is
+# refused.
 # With --if, note <n> must still be exactly <text> under the lock; with
 # --each, every note <n> must still be exactly its own <text>. Each number's
 # shape is checked, then its text, pair by pair in the order given, and the
@@ -641,19 +646,28 @@ cmd_rows() {
 # it reads in text mode otherwise and drops every carriage return. Other
 # awks take it for an ordinary variable and ignore it.
 close_notes() {
-    local mode="$1" file="$2"; shift 2
+    local mode="$1" file="$2" form="${3-}"; shift 3
     local guarded='' rows count n k lines tmp verb target dir text ended
     # The numbers to close, and with a guard the text each must still have.
+    # A form word other than these three leaves no number, and is refused.
     local -a nums=() expect=()
-    case ${1:-} in
-        --if)
-            guarded=1; expect=("${2-}"); shift 2; nums=("$@") ;;
-        --each)
-            guarded=1; shift
-            while [ $# -ge 2 ]; do nums+=("$1"); expect+=("$2"); shift 2; done ;;
-        *)
+    case $form in
+        --)
             nums=("$@") ;;
+        --if)
+            guarded=1; expect=("${1-}"); shift; nums=("$@") ;;
+        --each)
+            guarded=1
+            if [ $(( $# % 2 )) -ne 0 ]; then
+                echo 'later: --if-each needs a number and a text for each note' >&2
+                return 1
+            fi
+            while [ $# -gt 0 ]; do nums+=("$1"); expect+=("$2"); shift 2; done ;;
     esac
+    if [ "${#nums[@]}" -eq 0 ]; then
+        echo "later: $mode needs at least one note number" >&2
+        return 1
+    fi
     set -- "${nums[@]}"
     # Rewrite beside the real file, so a symlinked queue stays a symlink.
     # real_path may run in this shell (the folder lock), and it goes back to
@@ -751,6 +765,10 @@ cmd_close() {
     elif [ "$1" = '--if' ] && [ $# -ne 3 ]; then
         echo 'later: --if takes exactly one note number' >&2
         return 1
+    elif [ "$1" != '--if' ]; then
+        # Numbers alone. The form word goes in front, so whatever a caller
+        # gave first, --each among them, is checked as a number.
+        set -- -- "$@"
     fi
     file=$(queue_file "$PWD") || { echo 'later: cannot resolve the queue here' >&2; return 1; }
     [ -f "$file" ] || { echo 'later: no parked notes' >&2; return 1; }
