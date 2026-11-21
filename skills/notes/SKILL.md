@@ -55,7 +55,10 @@ The tool refuses a note over 2,000 characters: shorten it and park it again.
    shown whole needs no `show`, and neither does ticking off or dropping a
    note the user named.
 4. Never begin work on a parked note without the user's explicit confirmation
-   in this conversation.
+   in this conversation. A request to do a note is not that confirmation:
+   after `show`, or the listing for a line shown whole, the next step is the
+   question, and no work starts, reading and searching included, until the
+   user answers.
 5. When the work is done and verified, close the note with
    `{ action: "done", ids: ["<id>"] }`, taking the id from the listing you
    already have. Do not list again first: an id names its note until that
