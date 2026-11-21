@@ -15,6 +15,9 @@ const RESERVED = { tool: 'mcp__laterbox__queue', tool_use_id: 'toolu_01', consen
 // 1,999 once every run of whitespace is one space.
 const SPACED_NOTE = Array.from({ length: 100 }, () => 'abcdefghijklmnopqrs').join('      \n');
 
+// U+1F600, a character outside the basic plane: one code point and two UTF-16 units. Spec 5.1 counts code points.
+const ASTRAL = '\u{1F600}';
+
 // One row per refused input: what it is, the input, and the reason.
 const REFUSED: ReadonlyArray<readonly [string, unknown, string]> = [
     ['no action', {}, ACTION_REASON],
@@ -30,6 +33,11 @@ const REFUSED: ReadonlyArray<readonly [string, unknown, string]> = [
     [
         'add with a note of 2001 characters',
         { action: 'add', note: 'x'.repeat(2_001) },
+        'the note is 2001 characters and the limit is 2000; shorten it and park it again',
+    ],
+    [
+        'add with a note of 2001 characters outside the basic plane',
+        { action: 'add', note: ASTRAL.repeat(2_001) },
         'the note is 2001 characters and the limit is 2000; shorten it and park it again',
     ],
     ['show without ids', { action: 'show' }, IDS_REASON],
@@ -59,6 +67,11 @@ const ACCEPTED: ReadonlyArray<readonly [string, unknown, ToolRequest]> = [
         'add with a note of 2000 characters',
         { action: 'add', note: 'x'.repeat(2_000) },
         { action: 'add', note: 'x'.repeat(2_000) },
+    ],
+    [
+        'add with a note of 2000 characters outside the basic plane',
+        { action: 'add', note: ASTRAL.repeat(2_000) },
+        { action: 'add', note: ASTRAL.repeat(2_000) },
     ],
     [
         'add with a note of 2593 characters that collapse to 1999',
