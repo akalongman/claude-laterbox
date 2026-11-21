@@ -47,18 +47,18 @@ tell the user it was shortened.
    named the note by what it says and a listing earlier in this conversation
    already gives its id. A number the user gives ("drop note 3") always needs
    a fresh listing: it comes from whatever listing they last saw.
-2. Work out which note is meant. If it is not unambiguous, ask. When the
-   cut lines do not settle which note the user means (their words are in
-   no line, or more than one line could fit), read the candidates whole
-   with `show` before `done` or `drop`; a line that plainly holds the
-   user's words still needs no `show`. When a listing shown in this
+2. Work out which note is meant. If it is not unambiguous, ask. When no
+   line, and no note read whole, plainly holds every word the user used to
+   name the note, or more than one could fit, name the note you take to be
+   meant and ask before `done` or `drop`. When a listing shown in this
    conversation differs from the fresh one, or the note at the user's
    number in the fresh listing is not the one they described, name the
    note and ask before `done` or `drop`.
 3. Before you ask the user to confirm work on a note whose line ends its text
    in `...`, read it whole with `{ action: "show", ids: ["<id>"] }`. A line
    shown whole needs no `show`, and neither does ticking off or dropping a
-   note the user named.
+   note whose line plainly holds every word the user used to name it, or a
+   note the user confirmed after step 2's question.
 4. Never begin work on a parked note without the user's explicit confirmation
    in this conversation. A request to do a note is not that confirmation:
    after `show`, or the listing for a line shown whole, the next step is the
